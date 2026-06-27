@@ -907,8 +907,8 @@ func (m Model) loadMoreMessagesForActiveChat() tea.Cmd {
 	oldMessages := m.state.MessagesByChat[chatID]
 	currentLimit := m.messageLimit(chatID)
 	nextLimit := currentLimit + 80
-	if nextLimit > 1000 {
-		nextLimit = 1000
+	if nextLimit > 200 {
+		nextLimit = 200
 	}
 
 	return func() tea.Msg {
@@ -1192,7 +1192,7 @@ func (m Model) canLoadOlderMessages() bool {
 	}
 
 	limit := m.messageLimit(m.state.ActiveChatID)
-	if limit >= 1000 {
+	if limit >= 200 {
 		return false
 	}
 
@@ -1467,7 +1467,8 @@ func (m *Model) handleMouseClick(mouse tea.MouseMsg) tea.Cmd {
 	rightPanelTopY := panelTopY
 	messagePanelOuterHeight := messagePanelHeight + 2
 	composerTopY := rightPanelTopY + messagePanelOuterHeight
-	if mouse.Y >= composerTopY && mouse.Y < composerTopY+composerPanelHeight {
+	composerPanelOuterHeight := composerPanelHeight + 2
+	if mouse.Y >= composerTopY && mouse.Y < composerTopY+composerPanelOuterHeight {
 		if m.state.Session.Authorized {
 			m.composeInput.Focus()
 			m.state.Status = "Compose message"

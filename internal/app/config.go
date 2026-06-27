@@ -77,6 +77,15 @@ func LoadConfig() (Config, error) {
 	cachePath := filepath.Join(dataDir, defaultCacheDB)
 	sessionPath := filepath.Join(dataDir, defaultSession)
 	logPath := filepath.Join(dataDir, defaultLogFile)
+	if err := ensurePrivateFile(cachePath, 0o600); err != nil {
+		return Config{}, err
+	}
+	if err := ensurePrivateFile(sessionPath, 0o600); err != nil {
+		return Config{}, err
+	}
+	if err := ensurePrivateFile(logPath, 0o600); err != nil {
+		return Config{}, err
+	}
 	debugEnabled := os.Getenv("TG_TUI_DEBUG") == "1"
 	verboseEnabled := debugEnabled || os.Getenv("TG_TUI_VERBOSE") == "1"
 
@@ -162,9 +171,58 @@ func resolveDataDir() (string, error) {
 	}
 
 	dataDir := filepath.Join(baseDir, defaultAppName)
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return "", fmt.Errorf("create data dir: %w", err)
+	}
+	if err := os.Chmod(dataDir, 0o700); err != nil {
+		return "", fmt.Errorf("secure data dir permissions: %w", err)
 	}
 
 	return dataDir, nil
+}
+
+func ensurePrivateFile(path string, mode os.FileMode) error {
+	created, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, mode)
+	if err == nil {
+		if closeErr := created.Close(); closeErr != nil {
+			return fmt.Errorf("close %s: %w", path, closeErr)
+		}
+		return nil
+	}
+	if !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("create %s: %w", path, err)
+	}
+
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect %s: %w", path, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing symlink for %s", path)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("expected regular file at %s", path)
+	}
+
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", path, err)
+	}
+	defer file.Close()
+
+	openedInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("stat opened %s: %w", path, err)
+	}
+	if !openedInfo.Mode().IsRegular() {
+		return fmt.Errorf("expected regular file at %s", path)
+	}
+	if !os.SameFile(info, openedInfo) {
+		return fmt.Errorf("file changed while securing %s", path)
+	}
+	if err := file.Chmod(mode); err != nil {
+		return fmt.Errorf("secure permissions for %s: %w", path, err)
+	}
+
+	return nil
 }
