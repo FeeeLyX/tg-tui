@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +14,8 @@ import (
 	gotd "github.com/gotd/td/telegram"
 	tgauth "github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/telegram/auth/qrlogin"
+	"github.com/gotd/td/telegram/message/peer"
+	"github.com/gotd/td/telegram/query"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 	qrcode "rsc.io/qr"
@@ -30,25 +33,27 @@ type Client struct {
 	stopCh  chan struct{}
 	doneCh  chan error
 
-	mu        sync.RWMutex
-	runCtx    context.Context
-	auth      *tgauth.Client
-	authState app.AuthState
-	session   domains.AccountSession
-	phone     string
-	codeHash  string
-	closed    bool
-	started   bool
-	verbose   bool
+	mu           sync.RWMutex
+	runCtx       context.Context
+	auth         *tgauth.Client
+	authState    app.AuthState
+	session      domains.AccountSession
+	phone        string
+	codeHash     string
+	peerByChatID map[domains.ChatID]tg.InputPeerClass
+	closed       bool
+	started      bool
+	verbose      bool
 }
 
 func NewClient(config app.Config) *Client {
 	service := &Client{
-		updates: make(chan domains.AppEvent, 32),
-		readyCh: make(chan struct{}),
-		stopCh:  make(chan struct{}),
-		doneCh:  make(chan error, 1),
-		verbose: config.Verbose,
+		updates:      make(chan domains.AppEvent, 32),
+		readyCh:      make(chan struct{}),
+		stopCh:       make(chan struct{}),
+		doneCh:       make(chan error, 1),
+		verbose:      config.Verbose,
+		peerByChatID: make(map[domains.ChatID]tg.InputPeerClass),
 		authState: app.AuthState{
 			Step: app.AuthStepPhone,
 			Hint: "Enter your Telegram phone number to begin login.",
@@ -421,7 +426,65 @@ func (c *Client) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, e
 		return nil, err
 	}
 
-	return nil, ErrNotImplemented
+	if err := c.refreshSession(c.context()); err != nil {
+		return nil, err
+	}
+
+	c.mu.RLock()
+	authorized := c.session.Authorized
+	c.mu.RUnlock()
+	if !authorized {
+		return nil, errors.New("telegram session is not authorized")
+	}
+
+	raw := tg.NewClient(c.client)
+	iter := query.GetDialogs(raw).BatchSize(100).Iter()
+
+	chats := make([]domains.ChatSummary, 0, 64)
+	peers := make(map[domains.ChatID]tg.InputPeerClass)
+	for iter.Next(c.context()) {
+		elem := iter.Value()
+		if elem.Deleted() {
+			continue
+		}
+
+		peerUser, ok := elem.Dialog.GetPeer().(*tg.PeerUser)
+		if !ok {
+			// MVP scope: private chats only.
+			continue
+		}
+
+		user, ok := elem.Entities.User(peerUser.UserID)
+		if !ok {
+			continue
+		}
+
+		lastText, lastAt := extractLastMessage(elem.Last)
+		chat := domains.ChatSummary{
+			ID:              domains.ChatID(user.ID),
+			Title:           privateChatTitle(user),
+			LastMessageText: lastText,
+			LastMessageAt:   lastAt,
+			UnreadCount:     dialogUnreadCount(elem.Dialog),
+			IsOnline:        isUserOnline(user),
+		}
+		peers[chat.ID] = elem.Peer
+		chats = append(chats, chat)
+	}
+
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("list dialogs: %w", err)
+	}
+
+	sort.SliceStable(chats, func(i, j int) bool {
+		return chats[i].LastMessageAt.After(chats[j].LastMessageAt)
+	})
+
+	c.mu.Lock()
+	c.peerByChatID = peers
+	c.mu.Unlock()
+
+	return chats, nil
 }
 
 func (c *Client) LoadMessages(ctx context.Context, chatID domains.ChatID, limit int) ([]domains.Message, error) {
@@ -429,7 +492,60 @@ func (c *Client) LoadMessages(ctx context.Context, chatID domains.ChatID, limit 
 		return nil, err
 	}
 
-	return nil, ErrNotImplemented
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+
+	if err := c.refreshSession(c.context()); err != nil {
+		return nil, err
+	}
+
+	c.mu.RLock()
+	authorized := c.session.Authorized
+	peerInput, ok := c.peerByChatID[chatID]
+	c.mu.RUnlock()
+	if !authorized {
+		return nil, errors.New("telegram session is not authorized")
+	}
+
+	if !ok {
+		if _, err := c.ListPrivateChats(ctx); err != nil {
+			return nil, err
+		}
+
+		c.mu.RLock()
+		peerInput, ok = c.peerByChatID[chatID]
+		c.mu.RUnlock()
+		if !ok {
+			return nil, fmt.Errorf("chat %d is unavailable or no longer accessible", chatID)
+		}
+	}
+
+	raw := tg.NewClient(c.client)
+	iter := query.Messages(raw).GetHistory(peerInput).BatchSize(min(limit, 100)).Iter()
+
+	messages := make([]domains.Message, 0, limit)
+	for iter.Next(c.context()) {
+		elem := iter.Value()
+		messages = append(messages, mapMessage(elem.Msg, chatID, elem.Entities))
+		if len(messages) >= limit {
+			break
+		}
+	}
+
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("load messages: %w", err)
+	}
+
+	// Render oldest to newest in the UI.
+	for left, right := 0, len(messages)-1; left < right; left, right = left+1, right-1 {
+		messages[left], messages[right] = messages[right], messages[left]
+	}
+
+	return messages, nil
 }
 
 func (c *Client) SendMessage(ctx context.Context, chatID domains.ChatID, text string) (domains.Message, error) {
@@ -689,4 +805,121 @@ func mapAuthError(action string, err error) error {
 	}
 
 	return err
+}
+
+func privateChatTitle(user *tg.User) string {
+	if user == nil {
+		return "Unknown"
+	}
+
+	if user.Self {
+		return "Saved Messages"
+	}
+
+	fullName := strings.TrimSpace(strings.TrimSpace(user.FirstName + " " + user.LastName))
+	if fullName != "" {
+		return fullName
+	}
+
+	if user.Username != "" {
+		return "@" + user.Username
+	}
+
+	return fmt.Sprintf("User %d", user.ID)
+}
+
+func isUserOnline(user *tg.User) bool {
+	if user == nil {
+		return false
+	}
+
+	_, ok := user.Status.(*tg.UserStatusOnline)
+	return ok
+}
+
+func extractLastMessage(msg tg.NotEmptyMessage) (string, time.Time) {
+	if msg == nil {
+		return "", time.Time{}
+	}
+
+	timestamp := time.Unix(int64(msg.GetDate()), 0)
+	switch typed := msg.(type) {
+	case *tg.Message:
+		return strings.TrimSpace(typed.Message), timestamp
+	case *tg.MessageService:
+		return "[service message]", timestamp
+	default:
+		return "", timestamp
+	}
+}
+
+func mapMessage(msg tg.NotEmptyMessage, chatID domains.ChatID, entities peer.Entities) domains.Message {
+	result := domains.Message{
+		ID:     int64(msg.GetID()),
+		ChatID: chatID,
+		SentAt: time.Unix(int64(msg.GetDate()), 0),
+	}
+
+	if msg.GetOut() {
+		result.Direction = domains.MessageDirectionOutgoing
+	} else {
+		result.Direction = domains.MessageDirectionIncoming
+	}
+
+	if fromID, ok := msg.GetFromID(); ok {
+		result.SenderName = senderName(fromID, entities)
+	}
+
+	switch typed := msg.(type) {
+	case *tg.Message:
+		result.Text = strings.TrimSpace(typed.GetMessage())
+		if result.Text == "" {
+			result.Text = "[media/message without text]"
+		}
+	case *tg.MessageService:
+		result.Text = "[service message]"
+	default:
+		result.Text = "[unsupported message type]"
+	}
+
+	return result
+}
+
+func senderName(from tg.PeerClass, entities peer.Entities) string {
+	switch typed := from.(type) {
+	case *tg.PeerUser:
+		user, ok := entities.User(typed.UserID)
+		if !ok {
+			return ""
+		}
+		return privateChatTitle(user)
+	case *tg.PeerChat:
+		chat, ok := entities.Chat(typed.ChatID)
+		if ok && strings.TrimSpace(chat.Title) != "" {
+			return chat.Title
+		}
+	case *tg.PeerChannel:
+		channel, ok := entities.Channel(typed.ChannelID)
+		if ok && strings.TrimSpace(channel.Title) != "" {
+			return channel.Title
+		}
+	}
+
+	return ""
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+
+	return b
+}
+
+func dialogUnreadCount(dialog tg.DialogClass) int {
+	if typed, ok := dialog.(*tg.Dialog); ok {
+		return typed.UnreadCount
+	}
+
+	return 0
 }
