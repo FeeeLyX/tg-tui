@@ -29,6 +29,7 @@ var (
 	selectedMessageStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("11")).Bold(true)
 	selectedChatStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
 	chatSeparatorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+	pinnedTagStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
 )
 
 const commandTimeout = 20 * time.Second
@@ -629,7 +630,12 @@ func (m Model) renderChats(maxRows int) string {
 			unread = " (" + strconv.Itoa(chat.UnreadCount) + ")"
 		}
 
-		entry := truncateDisplayWidth(chat.Title+unread+preview, contentWidth)
+		pinnedTag := ""
+		if chat.Pinned {
+			pinnedTag = pinnedTagStyle.Render("[PIN] ")
+		}
+
+		entry := pinnedTag + truncateDisplayWidth(chat.Title+unread+preview, contentWidth-lipgloss.Width(pinnedTag))
 		entryStyle := chatEntryStyle(i-start, max(1, end-start))
 		if isActive {
 			entry = selectedChatStyle.Render(entry)

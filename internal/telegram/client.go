@@ -475,6 +475,7 @@ func (c *Client) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, e
 			LastMessageText: lastText,
 			LastMessageAt:   lastAt,
 			UnreadCount:     dialogUnreadCount(elem.Dialog),
+			Pinned:          dialogPinned(elem.Dialog),
 			IsOnline:        isUserOnline(user),
 		}
 		peers[chat.ID] = elem.Peer
@@ -486,6 +487,9 @@ func (c *Client) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, e
 	}
 
 	sort.SliceStable(chats, func(i, j int) bool {
+		if chats[i].Pinned != chats[j].Pinned {
+			return chats[i].Pinned
+		}
 		return chats[i].LastMessageAt.After(chats[j].LastMessageAt)
 	})
 
@@ -1040,4 +1044,12 @@ func dialogUnreadCount(dialog tg.DialogClass) int {
 	}
 
 	return 0
+}
+
+func dialogPinned(dialog tg.DialogClass) bool {
+	if typed, ok := dialog.(*tg.Dialog); ok {
+		return typed.Pinned
+	}
+
+	return false
 }
