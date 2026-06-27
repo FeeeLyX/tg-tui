@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -29,6 +30,8 @@ var (
 	selectedChatStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
 	chatSeparatorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 )
+
+const commandTimeout = 20 * time.Second
 
 type Model struct {
 	state                 app.State
@@ -147,8 +150,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if typed.state.Step != "" {
 				m.state.AuthState = typed.state
 			}
-			m.state.Error = typed.err
-			m.state.Status = "Telegram auth failed"
+			m.state.Error = userFacingError("Telegram auth", typed.err)
+			if isTimeoutError(typed.err) {
+				m.state.Status = "Telegram auth timed out"
+			} else {
+				m.state.Status = "Telegram auth failed"
+			}
 			return m, nil
 		}
 
@@ -187,8 +194,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case chatsLoadedMsg:
 		if typed.err != nil {
 			if !typed.silent {
-				m.state.Error = typed.err
-				m.state.Status = "Authorized, but chat sync failed"
+				m.state.Error = userFacingError("Chat sync", typed.err)
+				if isTimeoutError(typed.err) {
+					m.state.Status = "Chat sync timed out"
+				} else {
+					m.state.Status = "Authorized, but chat sync failed"
+				}
 			}
 			return m, nil
 		}
@@ -234,8 +245,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if typed.err != nil {
 			if !typed.silent {
-				m.state.Error = typed.err
-				m.state.Status = "Failed to load messages"
+				m.state.Error = userFacingError("Loading messages", typed.err)
+				if isTimeoutError(typed.err) {
+					m.state.Status = "Loading messages timed out"
+				} else {
+					m.state.Status = "Failed to load messages"
+				}
 			}
 			return m, nil
 		}
@@ -290,8 +305,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if typed.err != nil {
-			m.state.Error = typed.err
-			m.state.Status = "Failed to send message"
+			m.state.Error = userFacingError("Sending message", typed.err)
+			if isTimeoutError(typed.err) {
+				m.state.Status = "Sending message timed out"
+			} else {
+				m.state.Status = "Failed to send message"
+			}
 			return m, nil
 		}
 
@@ -727,7 +746,8 @@ func (m Model) submitAuth(value string) tea.Cmd {
 	authUC := m.authUC
 
 	return func() tea.Msg {
-		ctx := context.Background()
+		ctx, cancel := m.commandContext()
+		defer cancel()
 		nextState, session, err := authUC.SubmitInput(ctx, step, value)
 		return authResultMsg{state: nextState, session: session, err: err}
 	}
@@ -737,7 +757,8 @@ func (m Model) resendCode() tea.Cmd {
 	authUC := m.authUC
 
 	return func() tea.Msg {
-		ctx := context.Background()
+		ctx, cancel := m.commandContext()
+		defer cancel()
 		nextState, session, err := authUC.ResendCode(ctx)
 		return authResultMsg{state: nextState, session: session, err: err}
 	}
@@ -747,7 +768,8 @@ func (m Model) beginQRLogin() tea.Cmd {
 	authUC := m.authUC
 
 	return func() tea.Msg {
-		ctx := context.Background()
+		ctx, cancel := m.commandContext()
+		defer cancel()
 		nextState, session, err := authUC.BeginQRLogin(ctx)
 		return authResultMsg{state: nextState, session: session, err: err}
 	}
@@ -757,7 +779,8 @@ func (m Model) completeQRLogin() tea.Cmd {
 	authUC := m.authUC
 
 	return func() tea.Msg {
-		ctx := context.Background()
+		ctx, cancel := m.commandContext()
+		defer cancel()
 		nextState, session, err := authUC.CompleteQRLogin(ctx)
 		return authResultMsg{state: nextState, session: session, err: err}
 	}
@@ -767,7 +790,8 @@ func (m Model) loadPrivateChats() tea.Cmd {
 	chatUC := m.chatUC
 
 	return func() tea.Msg {
-		ctx := context.Background()
+		ctx, cancel := m.commandContext()
+		defer cancel()
 		chats, err := chatUC.ListPrivateChats(ctx)
 		return chatsLoadedMsg{chats: chats, err: err, silent: false}
 	}
@@ -777,7 +801,8 @@ func (m Model) loadPrivateChatsSilent() tea.Cmd {
 	chatUC := m.chatUC
 
 	return func() tea.Msg {
-		ctx := context.Background()
+		ctx, cancel := m.commandContext()
+		defer cancel()
 		chats, err := chatUC.ListPrivateChats(ctx)
 		return chatsLoadedMsg{chats: chats, err: err, silent: true}
 	}
@@ -789,7 +814,8 @@ func (m Model) loadMessagesForActiveChat() tea.Cmd {
 	limit := m.messageLimit(chatID)
 
 	return func() tea.Msg {
-		ctx := context.Background()
+		ctx, cancel := m.commandContext()
+		defer cancel()
 		messages, normalizedLimit, err := chatUC.LoadMessages(ctx, chatID, limit)
 		return messagesLoadedMsg{chatID: chatID, messages: messages, err: err, limit: normalizedLimit, silent: false}
 	}
@@ -801,7 +827,8 @@ func (m Model) refreshActiveMessages() tea.Cmd {
 	limit := m.messageLimit(chatID)
 
 	return func() tea.Msg {
-		ctx := context.Background()
+		ctx, cancel := m.commandContext()
+		defer cancel()
 		messages, normalizedLimit, err := chatUC.LoadMessages(ctx, chatID, limit)
 		return messagesLoadedMsg{
 			chatID:         chatID,
@@ -821,7 +848,8 @@ func (m Model) loadMoreMessagesForActiveChat() tea.Cmd {
 	currentLimit := m.messageLimit(chatID)
 
 	return func() tea.Msg {
-		ctx := context.Background()
+		ctx, cancel := m.commandContext()
+		defer cancel()
 		messages, nextLimit, err := chatUC.LoadMoreMessages(ctx, chatID, currentLimit)
 		return messagesLoadedMsg{
 			chatID:        chatID,
@@ -845,10 +873,35 @@ func (m Model) sendMessage(chatID domains.ChatID, text string, replyToMessageID 
 	chatUC := m.chatUC
 
 	return func() tea.Msg {
-		ctx := context.Background()
+		ctx, cancel := m.commandContext()
+		defer cancel()
 		message, err := chatUC.SendMessage(ctx, chatID, text, replyToMessageID)
 		return messageSentMsg{chatID: chatID, message: message, err: err}
 	}
+}
+
+func (m Model) commandContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), commandTimeout)
+}
+
+func isTimeoutError(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded)
+}
+
+func userFacingError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%s timed out after %s. Check your network and try again", operation, commandTimeout)
+	}
+
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("%s was canceled", operation)
+	}
+
+	return err
 }
 
 func (m *Model) activeChatIndex() int {

@@ -2,6 +2,8 @@ package telegram
 
 import (
 	"context"
+	crand "crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -26,6 +28,12 @@ import (
 
 var ErrNotImplemented = errors.New("telegram operation not implemented yet")
 
+const (
+	defaultLoadMessagesLimit = 50
+	maxLoadMessagesLimit     = 200
+	maxHistoryBatchSize      = 100
+)
+
 type Client struct {
 	client  *gotd.Client
 	updates chan domains.AppEvent
@@ -33,17 +41,18 @@ type Client struct {
 	stopCh  chan struct{}
 	doneCh  chan error
 
-	mu           sync.RWMutex
-	runCtx       context.Context
-	auth         *tgauth.Client
-	authState    app.AuthState
-	session      domains.AccountSession
-	phone        string
-	codeHash     string
-	peerByChatID map[domains.ChatID]tg.InputPeerClass
-	closed       bool
-	started      bool
-	verbose      bool
+	mu               sync.RWMutex
+	runCtx           context.Context
+	auth             *tgauth.Client
+	authState        app.AuthState
+	session          domains.AccountSession
+	phone            string
+	codeHash         string
+	peerByChatID     map[domains.ChatID]tg.InputPeerClass
+	closed           bool
+	started          bool
+	verbose          bool
+	closeUpdatesOnce sync.Once
 }
 
 func NewClient(config app.Config) *Client {
@@ -493,10 +502,10 @@ func (c *Client) LoadMessages(ctx context.Context, chatID domains.ChatID, limit 
 	}
 
 	if limit <= 0 {
-		limit = 50
+		limit = defaultLoadMessagesLimit
 	}
-	if limit > 200 {
-		limit = 200
+	if limit > maxLoadMessagesLimit {
+		limit = maxLoadMessagesLimit
 	}
 
 	if err := c.refreshSession(c.context()); err != nil {
@@ -505,27 +514,18 @@ func (c *Client) LoadMessages(ctx context.Context, chatID domains.ChatID, limit 
 
 	c.mu.RLock()
 	authorized := c.session.Authorized
-	peerInput, ok := c.peerByChatID[chatID]
 	c.mu.RUnlock()
 	if !authorized {
 		return nil, errors.New("telegram session is not authorized")
 	}
 
-	if !ok {
-		if _, err := c.ListPrivateChats(ctx); err != nil {
-			return nil, err
-		}
-
-		c.mu.RLock()
-		peerInput, ok = c.peerByChatID[chatID]
-		c.mu.RUnlock()
-		if !ok {
-			return nil, fmt.Errorf("chat %d is unavailable or no longer accessible", chatID)
-		}
+	peerInput, err := c.resolvePeerInput(ctx, chatID)
+	if err != nil {
+		return nil, err
 	}
 
 	raw := tg.NewClient(c.client)
-	iter := query.Messages(raw).GetHistory(peerInput).BatchSize(min(limit, 100)).Iter()
+	iter := query.Messages(raw).GetHistory(peerInput).BatchSize(min(limit, maxHistoryBatchSize)).Iter()
 
 	messages := make([]domains.Message, 0, limit)
 	for iter.Next(c.context()) {
@@ -581,26 +581,20 @@ func (c *Client) SendMessage(ctx context.Context, chatID domains.ChatID, text st
 
 	c.mu.RLock()
 	authorized := c.session.Authorized
-	peerInput, ok := c.peerByChatID[chatID]
 	c.mu.RUnlock()
 	if !authorized {
 		return domains.Message{}, errors.New("telegram session is not authorized")
 	}
 
-	if !ok {
-		if _, err := c.ListPrivateChats(ctx); err != nil {
-			return domains.Message{}, err
-		}
-
-		c.mu.RLock()
-		peerInput, ok = c.peerByChatID[chatID]
-		c.mu.RUnlock()
-		if !ok {
-			return domains.Message{}, fmt.Errorf("chat %d is unavailable or no longer accessible", chatID)
-		}
+	peerInput, err := c.resolvePeerInput(ctx, chatID)
+	if err != nil {
+		return domains.Message{}, err
 	}
 
-	randomID := time.Now().UnixNano()
+	randomID, err := newRandomMessageID()
+	if err != nil {
+		return domains.Message{}, fmt.Errorf("generate random message id: %w", err)
+	}
 	req := &tg.MessagesSendMessageRequest{
 		Peer:     peerInput,
 		Message:  body,
@@ -611,7 +605,7 @@ func (c *Client) SendMessage(ctx context.Context, chatID domains.ChatID, text st
 	}
 
 	raw := tg.NewClient(c.client)
-	_, err := raw.MessagesSendMessage(c.context(), req)
+	_, err = raw.MessagesSendMessage(c.context(), req)
 	if err != nil {
 		c.logRPCError("sending message", err)
 		return domains.Message{}, mapAuthError("sending message", err)
@@ -643,7 +637,9 @@ func (c *Client) Close() error {
 	c.mu.Unlock()
 
 	err := <-c.doneCh
-	close(c.updates)
+	c.closeUpdatesOnce.Do(func() {
+		close(c.updates)
+	})
 	if errors.Is(err, context.Canceled) {
 		return nil
 	}
@@ -921,8 +917,44 @@ func extractLastMessage(msg tg.NotEmptyMessage) (string, time.Time) {
 	case *tg.MessageService:
 		return "[service message]", timestamp
 	default:
-		return "", timestamp
+		return "[unknown message type]", timestamp
 	}
+}
+
+func (c *Client) resolvePeerInput(ctx context.Context, chatID domains.ChatID) (tg.InputPeerClass, error) {
+	c.mu.RLock()
+	peerInput, ok := c.peerByChatID[chatID]
+	c.mu.RUnlock()
+	if ok {
+		return peerInput, nil
+	}
+
+	if _, err := c.ListPrivateChats(ctx); err != nil {
+		return nil, err
+	}
+
+	c.mu.RLock()
+	peerInput, ok = c.peerByChatID[chatID]
+	c.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("chat %d is unavailable or no longer accessible", chatID)
+	}
+
+	return peerInput, nil
+}
+
+func newRandomMessageID() (int64, error) {
+	var buf [8]byte
+	if _, err := crand.Read(buf[:]); err != nil {
+		return 0, err
+	}
+
+	id := int64(binary.LittleEndian.Uint64(buf[:]) & 0x7fffffffffffffff)
+	if id == 0 {
+		return 1, nil
+	}
+
+	return id, nil
 }
 
 func mapMessage(msg tg.NotEmptyMessage, chatID domains.ChatID, entities peer.Entities) domains.Message {
