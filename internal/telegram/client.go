@@ -540,6 +540,23 @@ func (c *Client) LoadMessages(ctx context.Context, chatID domains.ChatID, limit 
 		return nil, fmt.Errorf("load messages: %w", err)
 	}
 
+	messageByID := make(map[int64]domains.Message, len(messages))
+	for i := range messages {
+		if messages[i].ID != 0 {
+			messageByID[messages[i].ID] = messages[i]
+		}
+	}
+	for i := range messages {
+		replyID := messages[i].ReplyToMessageID
+		if replyID == 0 {
+			continue
+		}
+		if replied, ok := messageByID[replyID]; ok {
+			messages[i].ReplyToSenderName = replied.SenderName
+			messages[i].ReplyToText = replied.Text
+		}
+	}
+
 	// Render oldest to newest in the UI.
 	for left, right := 0, len(messages)-1; left < right; left, right = left+1, right-1 {
 		messages[left], messages[right] = messages[right], messages[left]
@@ -601,12 +618,13 @@ func (c *Client) SendMessage(ctx context.Context, chatID domains.ChatID, text st
 	}
 
 	return domains.Message{
-		ID:         randomID,
-		ChatID:     chatID,
-		SenderName: "You",
-		Text:       body,
-		Direction:  domains.MessageDirectionOutgoing,
-		SentAt:     time.Now(),
+		ID:               randomID,
+		ChatID:           chatID,
+		SenderName:       "You",
+		Text:             body,
+		ReplyToMessageID: replyToMessageID,
+		Direction:        domains.MessageDirectionOutgoing,
+		SentAt:           time.Now(),
 	}, nil
 }
 
@@ -930,6 +948,7 @@ func mapMessage(msg tg.NotEmptyMessage, chatID domains.ChatID, entities peer.Ent
 		if result.Text == "" {
 			result.Text = "[media/message without text]"
 		}
+		result.ReplyToMessageID = extractReplyToMessageID(typed)
 	case *tg.MessageService:
 		result.Text = "[service message]"
 	default:
@@ -937,6 +956,19 @@ func mapMessage(msg tg.NotEmptyMessage, chatID domains.ChatID, entities peer.Ent
 	}
 
 	return result
+}
+
+func extractReplyToMessageID(message *tg.Message) int64 {
+	if message == nil || message.ReplyTo == nil {
+		return 0
+	}
+
+	switch typed := message.ReplyTo.(type) {
+	case *tg.MessageReplyHeader:
+		return int64(typed.ReplyToMsgID)
+	}
+
+	return 0
 }
 
 func senderName(from tg.PeerClass, entities peer.Entities) string {

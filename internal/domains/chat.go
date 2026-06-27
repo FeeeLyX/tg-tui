@@ -27,13 +27,16 @@ type ChatSummary struct {
 }
 
 type Message struct {
-	ID          int64
-	ChatID      ChatID
-	SenderName  string
-	Text        string
-	Direction   MessageDirection
-	SentAt      time.Time
-	DeliveredAt *time.Time
-	Pending     bool
-	Failed      bool
+	ID                int64
+	ChatID            ChatID
+	SenderName        string
+	Text              string
+	ReplyToMessageID  int64
+	ReplyToSenderName string
+	ReplyToText       string
+	Direction         MessageDirection
+	SentAt            time.Time
+	DeliveredAt       *time.Time
+	Pending           bool
+	Failed            bool
 }
