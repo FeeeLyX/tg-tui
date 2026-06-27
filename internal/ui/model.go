@@ -1,0 +1,1493 @@
+package ui
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
+
+	"github.com/FeeeLyX/tg-tui/internal/app"
+	"github.com/FeeeLyX/tg-tui/internal/app/usecase"
+	"github.com/FeeeLyX/tg-tui/internal/domains"
+)
+
+var (
+	panelStyle           = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
+	headerStyle          = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+	errorStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	mutedStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	incomingNameStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
+	outgoingNameStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
+	selectedMessageStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("11")).Bold(true)
+	selectedChatStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
+	chatSeparatorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+)
+
+const commandTimeout = 20 * time.Second
+
+type Model struct {
+	state                 app.State
+	client                app.TelegramClient
+	width                 int
+	height                int
+	authInput             textinput.Model
+	composeInput          textinput.Model
+	authUC                usecase.Auth
+	chatUC                usecase.Chat
+	conversationUC        usecase.Conversation
+	navigationUC          usecase.ListNavigation
+	messageViewUC         usecase.MessageView
+	messageView           bool
+	messageScroll         int
+	messageLimitByChat    map[domains.ChatID]int
+	selectedMessageByChat map[domains.ChatID]int
+	replyToMessageByChat  map[domains.ChatID]int64
+}
+
+type authResultMsg struct {
+	state   app.AuthState
+	session domains.AccountSession
+	err     error
+}
+
+type chatsLoadedMsg struct {
+	chats  []domains.ChatSummary
+	err    error
+	silent bool
+}
+
+type messagesLoadedMsg struct {
+	chatID         domains.ChatID
+	messages       []domains.Message
+	err            error
+	limit          int
+	preserveTop    bool
+	previousCount  int
+	preserveScroll bool
+	silent         bool
+}
+
+type refreshTickMsg struct{}
+
+type messageSentMsg struct {
+	chatID  domains.ChatID
+	message domains.Message
+	err     error
+}
+
+func NewModel(state app.State, client app.TelegramClient) Model {
+	authInput := textinput.New()
+	authInput.Placeholder = "+123456789"
+	authInput.Focus()
+	authInput.CharLimit = 64
+	authInput.Width = 28
+
+	composeInput := textinput.New()
+	composeInput.Placeholder = "Type a message"
+	composeInput.CharLimit = 4096
+	composeInput.Width = 48
+	composeInput.Blur()
+
+	return Model{
+		state:                 state,
+		client:                client,
+		authInput:             authInput,
+		composeInput:          composeInput,
+		authUC:                usecase.NewAuth(client),
+		chatUC:                usecase.NewChat(client),
+		conversationUC:        usecase.NewConversation(),
+		navigationUC:          usecase.NewListNavigation(),
+		messageViewUC:         usecase.NewMessageView(),
+		messageLimitByChat:    map[domains.ChatID]int{},
+		selectedMessageByChat: map[domains.ChatID]int{},
+		replyToMessageByChat:  map[domains.ChatID]int64{},
+	}
+}
+
+func (m Model) Init() tea.Cmd {
+	if m.state.Session.Authorized && m.client != nil {
+		m.state.Status = "Syncing private chats"
+		return tea.Batch(textinput.Blink, m.loadPrivateChats(), m.scheduleRefresh())
+	}
+
+	return textinput.Blink
+}
+
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch typed := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = typed.Width
+		m.height = typed.Height
+		return m, nil
+	case refreshTickMsg:
+		if !m.state.Session.Authorized || m.client == nil {
+			return m, m.scheduleRefresh()
+		}
+
+		cmds := []tea.Cmd{m.loadPrivateChatsSilent(), m.scheduleRefresh()}
+		if m.messageView && m.state.ActiveChatID != 0 {
+			cmds = append(cmds, m.refreshActiveMessages())
+		}
+		return m, tea.Batch(cmds...)
+	case tea.MouseMsg:
+		if !m.state.Session.Authorized {
+			return m, nil
+		}
+		if typed.Action != tea.MouseActionPress || typed.Button != tea.MouseButtonLeft {
+			return m, nil
+		}
+		return m, m.handleMouseClick(typed)
+	case authResultMsg:
+		if typed.err != nil {
+			if typed.state.Step != "" {
+				m.state.AuthState = typed.state
+			}
+			m.state.Error = userFacingError("Telegram auth", typed.err)
+			if isTimeoutError(typed.err) {
+				m.state.Status = "Telegram auth timed out"
+			} else {
+				m.state.Status = "Telegram auth failed"
+			}
+			return m, nil
+		}
+
+		m.state.Error = nil
+		m.state.AuthState = typed.state
+		m.state.Session = typed.session
+		m.messageView = false
+		m.messageScroll = 0
+		if typed.session.Authorized {
+			m.authInput.Blur()
+			m.composeInput.Focus()
+		} else {
+			m.authInput.Focus()
+			m.composeInput.Blur()
+		}
+		if typed.session.Authorized {
+			m.state.Status = "Authorized. Syncing private chats"
+		} else {
+			m.state.Status = "Awaiting Telegram auth input"
+		}
+
+		m.authInput.SetValue("")
+		m.authInput.Placeholder = authPlaceholder(m.state.AuthState.Step)
+		if typed.state.Step == app.AuthStepPassword {
+			m.authInput.EchoMode = textinput.EchoPassword
+			m.authInput.EchoCharacter = '*'
+		} else {
+			m.authInput.EchoMode = textinput.EchoNormal
+		}
+
+		if typed.session.Authorized && m.client != nil {
+			return m, m.loadPrivateChats()
+		}
+
+		return m, nil
+	case chatsLoadedMsg:
+		if typed.err != nil {
+			if !typed.silent {
+				m.state.Error = userFacingError("Chat sync", typed.err)
+				if isTimeoutError(typed.err) {
+					m.state.Status = "Chat sync timed out"
+				} else {
+					m.state.Status = "Authorized, but chat sync failed"
+				}
+			}
+			return m, nil
+		}
+
+		if !typed.silent {
+			m.state.Error = nil
+		}
+		previousActive := m.state.ActiveChatID
+		m.state.Chats = typed.chats
+		if previousActive != 0 {
+			stillPresent := false
+			for _, chat := range typed.chats {
+				if chat.ID == previousActive {
+					stillPresent = true
+					break
+				}
+			}
+			if stillPresent {
+				m.state.ActiveChatID = previousActive
+			} else {
+				m.state.ActiveChatID = 0
+			}
+		}
+		if m.state.ActiveChatID == 0 && len(typed.chats) > 0 {
+			m.state.ActiveChatID = typed.chats[0].ID
+		}
+
+		if typed.silent {
+			return m, nil
+		}
+
+		if len(typed.chats) == 0 {
+			m.state.Status = "Authorized. No private chats found"
+			return m, nil
+		} else {
+			m.state.Status = fmt.Sprintf("Loaded %d private chats", len(typed.chats))
+			return m, nil
+		}
+	case messagesLoadedMsg:
+		if typed.chatID != m.state.ActiveChatID {
+			return m, nil
+		}
+
+		if typed.err != nil {
+			if !typed.silent {
+				m.state.Error = userFacingError("Loading messages", typed.err)
+				if isTimeoutError(typed.err) {
+					m.state.Status = "Loading messages timed out"
+				} else {
+					m.state.Status = "Failed to load messages"
+				}
+			}
+			return m, nil
+		}
+
+		if !typed.silent {
+			m.state.Error = nil
+		}
+		previousMessages := m.state.MessagesByChat[typed.chatID]
+		previousSelectedIndex, hadSelection := m.selectedMessageByChat[typed.chatID]
+		if !hadSelection {
+			previousSelectedIndex = 0
+		}
+		m.state.MessagesByChat[typed.chatID] = typed.messages
+		m.messageLimitByChat[typed.chatID] = typed.limit
+		m.selectedMessageByChat[typed.chatID] = m.conversationUC.ReconcileSelection(usecase.SelectionRefreshInput{
+			PreviousMessages:     previousMessages,
+			NewMessages:          typed.messages,
+			CurrentSelectedIndex: previousSelectedIndex,
+			HasSelection:         hadSelection,
+			PreserveTop:          typed.preserveTop,
+			PreserveScroll:       typed.preserveScroll,
+			PreviousCount:        typed.previousCount,
+		})
+		if typed.preserveTop {
+			delta := len(typed.messages) - typed.previousCount
+			if delta > 0 {
+				m.messageScroll += delta
+			}
+			if maxScroll := m.maxMessageScroll(); m.messageScroll > maxScroll {
+				m.messageScroll = maxScroll
+			}
+		} else if typed.preserveScroll {
+			if maxScroll := m.maxMessageScroll(); m.messageScroll > maxScroll {
+				m.messageScroll = maxScroll
+			}
+		} else {
+			m.messageScroll = 0
+		}
+		m.messageView = true
+		if typed.silent {
+			return m, nil
+		}
+		if typed.preserveTop {
+			m.state.Status = fmt.Sprintf("Loaded %d older messages", max(0, len(typed.messages)-typed.previousCount))
+			return m, nil
+		}
+		m.state.Status = fmt.Sprintf("Loaded %d messages", len(typed.messages))
+		return m, nil
+	case messageSentMsg:
+		if typed.chatID != m.state.ActiveChatID {
+			return m, nil
+		}
+
+		if typed.err != nil {
+			m.state.Error = userFacingError("Sending message", typed.err)
+			if isTimeoutError(typed.err) {
+				m.state.Status = "Sending message timed out"
+			} else {
+				m.state.Status = "Failed to send message"
+			}
+			return m, nil
+		}
+
+		m.state.Error = nil
+		m.state.MessagesByChat[typed.chatID] = append(m.state.MessagesByChat[typed.chatID], typed.message)
+		m.selectedMessageByChat[typed.chatID] = len(m.state.MessagesByChat[typed.chatID]) - 1
+		delete(m.replyToMessageByChat, typed.chatID)
+		m.composeInput.SetValue("")
+		m.composeInput.Focus()
+		m.messageScroll = 0
+		m.state.Status = "Message sent"
+		return m, nil
+	case tea.KeyMsg:
+		if isMouseEscapeKey(typed) {
+			return m, nil
+		}
+
+		switch typed.String() {
+		case "ctrl+c", "q":
+			return m, tea.Quit
+		case "up":
+			if m.state.Session.Authorized {
+				if m.messageView {
+					if m.scrollMessages(1) {
+						m.state.Status = "Scrolled up"
+						return m, nil
+					}
+
+					if m.canLoadOlderMessages() {
+						m.state.Status = "Loading older messages"
+						m.state.Error = nil
+						return m, m.loadMoreMessagesForActiveChat()
+					}
+
+					m.state.Status = "Reached oldest loaded message"
+					return m, nil
+				}
+
+				if m.selectRelativeChat(-1) {
+					m.state.Status = "Chat selected. Press Enter to load messages"
+					m.state.Error = nil
+					m.messageScroll = 0
+				}
+				return m, nil
+			}
+		case "down":
+			if m.state.Session.Authorized {
+				if m.messageView {
+					if m.scrollMessages(-1) {
+						m.state.Status = "Scrolled down"
+					} else {
+						m.state.Status = "Reached newest loaded message"
+					}
+					return m, nil
+				}
+
+				if m.selectRelativeChat(1) {
+					m.state.Status = "Chat selected. Press Enter to load messages"
+					m.state.Error = nil
+					m.messageScroll = 0
+				}
+				return m, nil
+			}
+		case "esc", "left":
+			if m.state.Session.Authorized && m.messageView {
+				m.messageView = false
+				m.messageScroll = 0
+				m.composeInput.Blur()
+				m.state.Status = "Back to chat selection"
+				return m, nil
+			}
+		case "right":
+			if m.state.Session.Authorized && !m.messageView {
+				if m.state.ActiveChatID == 0 || m.client == nil {
+					return m, nil
+				}
+
+				m.state.Status = "Loading messages"
+				m.state.Error = nil
+				m.composeInput.Focus()
+				return m, m.loadMessagesForActiveChat()
+			}
+		case "g":
+			if !m.state.Session.Authorized {
+				if m.client == nil {
+					m.state.Error = fmt.Errorf("telegram credentials are unavailable")
+					m.state.Status = "Telegram credentials required"
+					return m, nil
+				}
+
+				m.state.Status = "Generating Telegram QR login"
+				m.state.Error = nil
+				return m, m.beginQRLogin()
+			}
+		case "ctrl+r":
+			if m.state.Session.Authorized && m.messageView {
+				selected, ok := m.selectedCurrentMessage()
+				if !ok {
+					m.state.Status = "Select a message to reply"
+					return m, nil
+				}
+				m.conversationUC.SetReplyTarget(m.replyToMessageByChat, m.state.ActiveChatID, selected.ID)
+				m.state.Status = fmt.Sprintf("Replying to: %s", previewReplyText(selected.Text))
+				return m, nil
+			}
+
+			if !m.state.Session.Authorized && m.state.AuthState.Step == app.AuthStepCode {
+				if m.client == nil {
+					m.state.Error = fmt.Errorf("telegram client is not initialized")
+					return m, nil
+				}
+
+				m.state.Status = "Requesting another Telegram login code"
+				m.state.Error = nil
+				return m, m.resendCode()
+			}
+		case "enter":
+			if m.state.Session.Authorized {
+				if m.state.ActiveChatID == 0 || m.client == nil {
+					return m, nil
+				}
+
+				if m.messageView {
+					m.composeInput.Focus()
+					text := strings.TrimSpace(m.composeInput.Value())
+					if text == "" {
+						m.state.Status = "Type a message to send"
+						return m, nil
+					}
+
+					m.state.Status = "Sending message"
+					m.state.Error = nil
+					replyTo := m.replyToMessageByChat[m.state.ActiveChatID]
+					return m, m.sendMessage(m.state.ActiveChatID, text, replyTo)
+				}
+
+				m.state.Status = "Loading messages"
+				m.state.Error = nil
+				m.composeInput.Focus()
+				return m, m.loadMessagesForActiveChat()
+			}
+
+			if !m.state.Session.Authorized {
+				if m.client == nil {
+					if m.state.Error == nil {
+						m.state.Error = fmt.Errorf("telegram credentials are unavailable")
+					}
+					m.state.Status = "Telegram credentials required"
+					return m, nil
+				}
+
+				if m.state.AuthState.Step == app.AuthStepQR {
+					m.state.Status = "Checking Telegram QR confirmation"
+					m.state.Error = nil
+					return m, m.completeQRLogin()
+				}
+
+				value := strings.TrimSpace(m.authInput.Value())
+				if value == "" {
+					return m, nil
+				}
+
+				m.state.Status = "Submitting Telegram auth input"
+				m.state.Error = nil
+				return m, m.submitAuth(value)
+			}
+		case "ctrl+u":
+			if m.state.Session.Authorized && m.messageView {
+				m.conversationUC.ClearReplyTarget(m.replyToMessageByChat, m.state.ActiveChatID)
+				m.state.Status = "Reply target cleared"
+				return m, nil
+			}
+		case "ctrl+up":
+			if m.state.Session.Authorized && m.messageView {
+				if m.moveMessageSelection(-1) {
+					m.state.Status = "Message selected"
+				} else {
+					m.state.Status = "Reached oldest message"
+				}
+				return m, nil
+			}
+		case "ctrl+down":
+			if m.state.Session.Authorized && m.messageView {
+				if m.moveMessageSelection(1) {
+					m.state.Status = "Message selected"
+				} else {
+					m.state.Status = "Reached newest message"
+				}
+				return m, nil
+			}
+		}
+	}
+
+	var cmd tea.Cmd
+	if !m.state.Session.Authorized {
+		m.authInput, cmd = m.authInput.Update(msg)
+		return m, cmd
+	}
+
+	m.composeInput, cmd = m.composeInput.Update(msg)
+	return m, cmd
+}
+
+func (m Model) View() string {
+	if m.width == 0 {
+		m.width = 120
+	}
+
+	if m.height == 0 {
+		m.height = 32
+	}
+
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		headerStyle.Render("tg-tui"),
+		m.renderBody(),
+		m.renderStatus(),
+	)
+
+	return lipgloss.NewStyle().Padding(1, 2).Render(content)
+}
+
+func (m Model) renderBody() string {
+	if !m.state.Session.Authorized {
+		return m.renderAuth()
+	}
+
+	leftWidth := max(30, m.width/3)
+	rightWidth := max(40, m.width-leftWidth-8)
+	panelHeight := max(12, m.height-6)
+	messagePanelHeight, composerPanelHeight := m.rightPaneHeights(panelHeight)
+	messageRows := max(1, messagePanelHeight-2)
+	composerRows := max(1, composerPanelHeight-2)
+
+	return lipgloss.JoinHorizontal(lipgloss.Top,
+		panelStyle.Width(leftWidth).Height(panelHeight).Render(m.renderChats(max(1, panelHeight-2))),
+		lipgloss.JoinVertical(lipgloss.Left,
+			panelStyle.Width(rightWidth).Height(messagePanelHeight).Render(m.renderMessages(messageRows)),
+			panelStyle.Width(rightWidth).Height(composerPanelHeight).Render(m.renderComposer(composerRows)),
+		),
+	)
+}
+
+func (m Model) renderAuth() string {
+	stepTitle := map[app.AuthStep]string{
+		app.AuthStepPhone:    "Enter your phone number",
+		app.AuthStepCode:     "Enter the login code",
+		app.AuthStepQR:       "Scan Telegram QR login",
+		app.AuthStepPassword: "Enter your 2FA password",
+	}[m.state.AuthState.Step]
+
+	var lines []string
+	lines = append(lines, headerStyle.Render(stepTitle))
+	lines = append(lines, mutedStyle.Render("Telegram credentials are loaded from TG_TUI_API_ID/TG_TUI_API_HASH."))
+	if m.state.CredentialSummary != "" {
+		lines = append(lines, mutedStyle.Render(m.state.CredentialSummary))
+	}
+	if m.state.AuthState.Hint != "" {
+		lines = append(lines, mutedStyle.Render(m.state.AuthState.Hint))
+	}
+	if m.state.CredentialNotice != "" {
+		lines = append(lines, errorStyle.Render(m.state.CredentialNotice))
+	}
+	if m.state.Error != nil {
+		lines = append(lines, errorStyle.Render(m.state.Error.Error()))
+	}
+	lines = append(lines, "")
+	lines = append(lines, m.authInput.View())
+	lines = append(lines, "")
+	if m.state.AuthState.Step == app.AuthStepQR {
+		lines = append(lines, mutedStyle.Render("Press g to regenerate QR. Press Enter after scanning to verify login."))
+	} else if m.state.AuthState.Step == app.AuthStepCode {
+		lines = append(lines, mutedStyle.Render("Press Enter to submit code. Press r to request another code."))
+	} else {
+		lines = append(lines, mutedStyle.Render("Press Enter to submit. Press g to switch to QR login."))
+	}
+
+	return panelStyle.Width(max(60, m.width-8)).Render(strings.Join(lines, "\n"))
+}
+
+func (m Model) renderChats(maxRows int) string {
+	lines := []string{headerStyle.Render("Chats")}
+	if len(m.state.Chats) == 0 {
+		lines = append(lines, mutedStyle.Render("No chats loaded yet."))
+		return strings.Join(clampLines(lines, maxRows), "\n")
+	}
+
+	currentIndex := m.activeChatIndex()
+	if currentIndex == -1 {
+		currentIndex = 0
+		m.state.ActiveChatID = m.state.Chats[0].ID
+	}
+
+	leftWidth := max(30, m.width/3)
+	contentWidth := max(12, leftWidth-6)
+	start, end := m.navigationUC.VisibleWindow(len(m.state.Chats), currentIndex, maxRows)
+
+	if start > 0 {
+		lines = append(lines, mutedStyle.Render("..."))
+	}
+
+	for i := start; i < end; i++ {
+		chat := m.state.Chats[i]
+		prefix := "  "
+		isActive := chat.ID == m.state.ActiveChatID
+		if isActive {
+			prefix = "> "
+		}
+
+		preview := oneLine(chat.LastMessageText)
+		if preview != "" {
+			preview = " - " + truncateRunes(preview, 36)
+		}
+
+		unread := ""
+		if chat.UnreadCount > 0 {
+			unread = " (" + strconv.Itoa(chat.UnreadCount) + ")"
+		}
+
+		entry := truncateDisplayWidth(chat.Title+unread+preview, contentWidth)
+		entryStyle := chatEntryStyle(i-start, max(1, end-start))
+		if isActive {
+			entry = selectedChatStyle.Render(entry)
+		} else {
+			entry = entryStyle.Render(entry)
+		}
+		lines = append(lines, fmt.Sprintf("%s%s", prefix, entry))
+		if i < end-1 {
+			separator := strings.Repeat("·", max(3, contentWidth-2))
+			lines = append(lines, chatSeparatorStyle.Render("  "+separator))
+		}
+	}
+
+	if end < len(m.state.Chats) {
+		lines = append(lines, mutedStyle.Render("..."))
+	}
+
+	return strings.Join(clampLines(lines, maxRows), "\n")
+}
+
+func (m Model) renderMessages(maxRows int) string {
+	lines := []string{headerStyle.Render("Messages")}
+	rightWidth := max(40, m.width-max(30, m.width/3)-8)
+	messageWidth := max(20, rightWidth-6)
+
+	messages, loaded := m.state.MessagesByChat[m.state.ActiveChatID]
+	hasScrollLine := loaded && len(messages) > 1
+	messageRows := max(0, maxRows-1)
+	if hasScrollLine {
+		messageRows = max(0, messageRows-1)
+	}
+
+	if !loaded {
+		if m.state.ActiveChatID == 0 {
+			lines = append(lines, mutedStyle.Render("Select a chat first."))
+		} else {
+			lines = append(lines, mutedStyle.Render("Press Enter to load messages for selected chat."))
+		}
+	} else if len(messages) == 0 {
+		lines = append(lines, mutedStyle.Render("No recent messages in this chat."))
+	} else {
+		for _, line := range m.buildMessageViewLines(messages, messageWidth, messageRows) {
+			lines = append(lines, line)
+		}
+
+		if hasScrollLine {
+			lines = append(lines, mutedStyle.Render(fmt.Sprintf("Scroll: %d/%d", m.messageScroll, m.maxMessageScroll())))
+		}
+	}
+
+	return strings.Join(clampLines(lines, maxRows), "\n")
+}
+
+func (m Model) renderComposer(maxRows int) string {
+	lines := []string{headerStyle.Render("Compose")}
+
+	if m.state.Session.Authorized && m.messageView {
+		if replyMessage, ok := m.replyTargetMessage(); ok {
+			lines = append(lines, mutedStyle.Render(fmt.Sprintf("Replying to: %s", previewReplyText(replyMessage.Text))))
+		} else {
+			lines = append(lines, mutedStyle.Render("Reply target: none - press Ctrl+r on a selected message"))
+		}
+		lines = append(lines, m.composeInput.View())
+		lines = append(lines, mutedStyle.Render("Enter sends. Ctrl+u clears reply. Esc/Left returns to chats."))
+	} else if m.state.Session.Authorized {
+		lines = append(lines, mutedStyle.Render("Open a chat to type a message."))
+		lines = append(lines, m.composeInput.View())
+		lines = append(lines, mutedStyle.Render("Enter opens the selected chat."))
+	} else {
+		lines = append(lines, mutedStyle.Render("Sign in to compose messages."))
+		lines = append(lines, m.composeInput.View())
+	}
+
+	return strings.Join(clampLines(lines, maxRows), "\n")
+}
+
+func (m Model) renderStatus() string {
+	status := m.state.Status
+	if status == "" {
+		status = "Idle"
+	}
+
+	line := mutedStyle.Render(status)
+	if m.state.Error != nil {
+		line = errorStyle.Render(m.state.Error.Error())
+	}
+
+	return lipgloss.NewStyle().PaddingTop(1).Render(line)
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+
+	return b
+}
+
+func authPlaceholder(step app.AuthStep) string {
+	switch step {
+	case app.AuthStepCode:
+		return "12345"
+	case app.AuthStepPassword:
+		return "2FA password"
+	case app.AuthStepQR:
+		return "Press g to generate QR"
+	default:
+		return "+123456789"
+	}
+}
+
+func (m Model) submitAuth(value string) tea.Cmd {
+	step := m.state.AuthState.Step
+	authUC := m.authUC
+
+	return func() tea.Msg {
+		ctx, cancel := m.commandContext()
+		defer cancel()
+		nextState, session, err := authUC.SubmitInput(ctx, step, value)
+		return authResultMsg{state: nextState, session: session, err: err}
+	}
+}
+
+func (m Model) resendCode() tea.Cmd {
+	authUC := m.authUC
+
+	return func() tea.Msg {
+		ctx, cancel := m.commandContext()
+		defer cancel()
+		nextState, session, err := authUC.ResendCode(ctx)
+		return authResultMsg{state: nextState, session: session, err: err}
+	}
+}
+
+func (m Model) beginQRLogin() tea.Cmd {
+	authUC := m.authUC
+
+	return func() tea.Msg {
+		ctx, cancel := m.commandContext()
+		defer cancel()
+		nextState, session, err := authUC.BeginQRLogin(ctx)
+		return authResultMsg{state: nextState, session: session, err: err}
+	}
+}
+
+func (m Model) completeQRLogin() tea.Cmd {
+	authUC := m.authUC
+
+	return func() tea.Msg {
+		ctx, cancel := m.commandContext()
+		defer cancel()
+		nextState, session, err := authUC.CompleteQRLogin(ctx)
+		return authResultMsg{state: nextState, session: session, err: err}
+	}
+}
+
+func (m Model) loadPrivateChats() tea.Cmd {
+	chatUC := m.chatUC
+
+	return func() tea.Msg {
+		ctx, cancel := m.commandContext()
+		defer cancel()
+		chats, err := chatUC.ListPrivateChats(ctx)
+		return chatsLoadedMsg{chats: chats, err: err, silent: false}
+	}
+}
+
+func (m Model) loadPrivateChatsSilent() tea.Cmd {
+	chatUC := m.chatUC
+
+	return func() tea.Msg {
+		ctx, cancel := m.commandContext()
+		defer cancel()
+		chats, err := chatUC.ListPrivateChats(ctx)
+		return chatsLoadedMsg{chats: chats, err: err, silent: true}
+	}
+}
+
+func (m Model) loadMessagesForActiveChat() tea.Cmd {
+	chatUC := m.chatUC
+	chatID := m.state.ActiveChatID
+	limit := m.messageLimit(chatID)
+
+	return func() tea.Msg {
+		ctx, cancel := m.commandContext()
+		defer cancel()
+		messages, normalizedLimit, err := chatUC.LoadMessages(ctx, chatID, limit)
+		return messagesLoadedMsg{chatID: chatID, messages: messages, err: err, limit: normalizedLimit, silent: false}
+	}
+}
+
+func (m Model) refreshActiveMessages() tea.Cmd {
+	chatUC := m.chatUC
+	chatID := m.state.ActiveChatID
+	limit := m.messageLimit(chatID)
+
+	return func() tea.Msg {
+		ctx, cancel := m.commandContext()
+		defer cancel()
+		messages, normalizedLimit, err := chatUC.LoadMessages(ctx, chatID, limit)
+		return messagesLoadedMsg{
+			chatID:         chatID,
+			messages:       messages,
+			err:            err,
+			limit:          normalizedLimit,
+			preserveScroll: true,
+			silent:         true,
+		}
+	}
+}
+
+func (m Model) loadMoreMessagesForActiveChat() tea.Cmd {
+	chatUC := m.chatUC
+	chatID := m.state.ActiveChatID
+	oldMessages := m.state.MessagesByChat[chatID]
+	currentLimit := m.messageLimit(chatID)
+
+	return func() tea.Msg {
+		ctx, cancel := m.commandContext()
+		defer cancel()
+		messages, nextLimit, err := chatUC.LoadMoreMessages(ctx, chatID, currentLimit)
+		return messagesLoadedMsg{
+			chatID:        chatID,
+			messages:      messages,
+			err:           err,
+			limit:         nextLimit,
+			preserveTop:   true,
+			previousCount: len(oldMessages),
+			silent:        false,
+		}
+	}
+}
+
+func (m Model) scheduleRefresh() tea.Cmd {
+	return tea.Tick(5*time.Second, func(time.Time) tea.Msg {
+		return refreshTickMsg{}
+	})
+}
+
+func (m Model) sendMessage(chatID domains.ChatID, text string, replyToMessageID int64) tea.Cmd {
+	chatUC := m.chatUC
+
+	return func() tea.Msg {
+		ctx, cancel := m.commandContext()
+		defer cancel()
+		message, err := chatUC.SendMessage(ctx, chatID, text, replyToMessageID)
+		return messageSentMsg{chatID: chatID, message: message, err: err}
+	}
+}
+
+func (m Model) commandContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), commandTimeout)
+}
+
+func isTimeoutError(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded)
+}
+
+func userFacingError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%s timed out after %s. Check your network and try again", operation, commandTimeout)
+	}
+
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("%s was canceled", operation)
+	}
+
+	return err
+}
+
+func (m *Model) activeChatIndex() int {
+	return m.navigationUC.ActiveIndex(m.state.Chats, m.state.ActiveChatID)
+}
+
+func (m *Model) selectRelativeChat(delta int) bool {
+	nextID, changed := m.navigationUC.SelectRelative(m.state.Chats, m.state.ActiveChatID, delta)
+	if !changed {
+		return false
+	}
+	m.state.ActiveChatID = nextID
+	return true
+}
+
+func oneLine(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+
+	replacer := strings.NewReplacer("\n", " ", "\r", " ", "\t", " ")
+	compact := replacer.Replace(trimmed)
+	compact = strings.Map(func(r rune) rune {
+		// Strip control characters that can break terminal layout.
+		if unicode.IsControl(r) {
+			return -1
+		}
+
+		// Strip emoji and emoji-related joiner/selector runes because some
+		// terminal font stacks report inconsistent width for these sequences.
+		if isEmojiRune(r) {
+			return -1
+		}
+		return r
+	}, compact)
+	return strings.Join(strings.Fields(compact), " ")
+}
+
+func isEmojiRune(r rune) bool {
+	if r == '\u200d' || r == '\ufe0f' || r == '\u20e3' {
+		return true
+	}
+
+	if r >= 0x1f3fb && r <= 0x1f3ff {
+		return true
+	}
+
+	if r >= 0x1f1e6 && r <= 0x1f1ff {
+		return true
+	}
+
+	if r >= 0x1f300 && r <= 0x1faff {
+		return true
+	}
+
+	return unicode.Is(unicode.So, r)
+}
+
+func truncateRunes(value string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
+
+	runes := []rune(value)
+	if len(runes) <= maxLen {
+		return value
+	}
+
+	if maxLen == 1 {
+		return "…"
+	}
+
+	return string(runes[:maxLen-1]) + "…"
+}
+
+func truncateDisplayWidth(value string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+
+	clean := oneLine(value)
+	if clean == "" {
+		return ""
+	}
+
+	return runewidth.Truncate(clean, maxWidth, "…")
+}
+
+func (m Model) maxMessageScroll() int {
+	messages, ok := m.state.MessagesByChat[m.state.ActiveChatID]
+	if !ok {
+		return 0
+	}
+	if len(messages) <= 1 {
+		return 0
+	}
+
+	return len(messages) - 1
+}
+
+func (m *Model) scrollMessages(delta int) bool {
+	_, ok := m.state.MessagesByChat[m.state.ActiveChatID]
+	if !ok {
+		return false
+	}
+
+	maxScroll := m.maxMessageScroll()
+	next := m.messageScroll + delta
+	if next < 0 {
+		next = 0
+	}
+	if next > maxScroll {
+		next = maxScroll
+	}
+
+	if next == m.messageScroll {
+		return false
+	}
+
+	m.messageScroll = next
+	return true
+}
+
+func (m *Model) moveMessageSelection(delta int) bool {
+	messages, ok := m.state.MessagesByChat[m.state.ActiveChatID]
+	if !ok || len(messages) == 0 {
+		return false
+	}
+
+	current := m.selectedMessageByChat[m.state.ActiveChatID]
+	next, changed := m.conversationUC.MoveSelection(len(messages), current, delta)
+	if !changed {
+		return false
+	}
+
+	m.selectedMessageByChat[m.state.ActiveChatID] = next
+	m.keepSelectedMessageVisible(len(messages), next)
+	return true
+}
+
+func (m *Model) keepSelectedMessageVisible(totalMessages int, selectedIndex int) {
+	visibleCount := m.estimatedVisibleMessageCount()
+	m.messageScroll = m.messageViewUC.KeepSelectedVisible(totalMessages, selectedIndex, m.messageScroll, visibleCount)
+}
+
+func (m Model) estimatedVisibleMessageCount() int {
+	panelHeight := max(12, m.height-6)
+	messagePanelHeight, _ := m.rightPaneHeights(panelHeight)
+	contentRows := max(1, messagePanelHeight-2)
+
+	messages, loaded := m.state.MessagesByChat[m.state.ActiveChatID]
+	hasScrollLine := loaded && len(messages) > 1
+	return m.messageViewUC.EstimatedVisibleCount(contentRows, hasScrollLine)
+}
+
+func (m Model) messageLimit(chatID domains.ChatID) int {
+	if limit, ok := m.messageLimitByChat[chatID]; ok && limit > 0 {
+		return limit
+	}
+
+	return 80
+}
+
+func (m Model) canLoadOlderMessages() bool {
+	if m.state.ActiveChatID == 0 {
+		return false
+	}
+
+	messages, ok := m.state.MessagesByChat[m.state.ActiveChatID]
+	if !ok || len(messages) == 0 {
+		return false
+	}
+
+	limit := m.messageLimit(m.state.ActiveChatID)
+	if limit >= 200 {
+		return false
+	}
+
+	// If server returned fewer than requested, there is likely no older page left.
+	return len(messages) >= limit
+}
+
+func (m Model) buildMessageViewLines(messages []domains.Message, width int, rowBudget int) []string {
+	if len(messages) == 0 || rowBudget <= 0 {
+		return nil
+	}
+
+	end := len(messages) - m.messageScroll
+	if end < 0 {
+		end = 0
+	}
+	if end > len(messages) {
+		end = len(messages)
+	}
+
+	rowsRemaining := rowBudget
+	blocks := make([][]string, 0, rowBudget)
+
+	for i := end - 1; i >= 0 && rowsRemaining > 0; i-- {
+		selected := m.selectedMessageByChat[m.state.ActiveChatID] == i
+		block := renderMessageBlock(messages[i], width, selected)
+		if len(block) == 0 {
+			continue
+		}
+
+		need := len(block)
+		if len(blocks) > 0 {
+			need++ // spacer line between messages.
+		}
+		if need > rowsRemaining {
+			break
+		}
+
+		if len(blocks) > 0 {
+			blocks = append(blocks, []string{""})
+			rowsRemaining--
+		}
+
+		blocks = append(blocks, block)
+		rowsRemaining -= len(block)
+	}
+
+	result := make([]string, 0, rowBudget)
+	for i := len(blocks) - 1; i >= 0; i-- {
+		result = append(result, blocks[i]...)
+	}
+
+	return result
+}
+
+func renderMessageBlock(message domains.Message, width int, selected bool) []string {
+	var name string
+	var nameStyle lipgloss.Style
+	if message.Direction == domains.MessageDirectionOutgoing {
+		name = "You"
+		nameStyle = outgoingNameStyle
+	} else {
+		name = oneLine(message.SenderName)
+		if name == "" {
+			name = "Incoming"
+		}
+		nameStyle = incomingNameStyle
+	}
+
+	body := oneLine(message.Text)
+	if body == "" {
+		body = "[empty]"
+	}
+
+	replyPreview := ""
+	if message.ReplyToMessageID > 0 {
+		replyText := oneLine(message.ReplyToText)
+		if replyText == "" {
+			replyText = fmt.Sprintf("message #%d", message.ReplyToMessageID)
+		}
+		replySender := oneLine(message.ReplyToSenderName)
+		if replySender != "" {
+			replyPreview = fmt.Sprintf("Reply to %s: %s", replySender, replyText)
+		} else {
+			replyPreview = fmt.Sprintf("Reply to: %s", replyText)
+		}
+	}
+
+	prefixText := name + ": "
+	prefixWidth := lipgloss.Width(prefixText)
+	contentWidth := width - prefixWidth
+	if contentWidth < 8 {
+		contentWidth = width
+		prefixText = ""
+		prefixWidth = 0
+	}
+
+	wrappedBody := runewidth.Wrap(body, contentWidth)
+	bodyLines := strings.Split(wrappedBody, "\n")
+	for i := range bodyLines {
+		bodyLines[i] = truncateDisplayWidth(bodyLines[i], contentWidth)
+	}
+
+	line := ""
+	if len(bodyLines) > 0 {
+		line = prefixText + bodyLines[0]
+	}
+	line = oneLine(line)
+	if line == "" {
+		line = name + ":"
+	}
+
+	rawLines := make([]string, 0, len(bodyLines)+1)
+	if replyPreview != "" {
+		rawLines = append(rawLines, truncateDisplayWidth(replyPreview, width))
+	}
+	rawLines = append(rawLines, line)
+	if len(bodyLines) > 1 {
+		indent := strings.Repeat(" ", prefixWidth)
+		for _, rest := range bodyLines[1:] {
+			rawLines = append(rawLines, indent+rest)
+		}
+	}
+
+	out := make([]string, 0, len(rawLines))
+	for i, raw := range rawLines {
+		clean := truncateDisplayWidth(raw, width)
+		if i == 0 && replyPreview != "" {
+			clean = mutedStyle.Render(clean)
+		} else if ((i == 0 && replyPreview == "") || (i == 1 && replyPreview != "")) && prefixText != "" {
+			clean = colorizePrefix(clean, name+":", nameStyle)
+		}
+		if selected {
+			clean = selectedMessageStyle.Render(clean)
+		}
+		if message.Direction == domains.MessageDirectionOutgoing {
+			out = append(out, lipgloss.NewStyle().Width(width).Align(lipgloss.Right).Render(clean))
+		} else {
+			out = append(out, lipgloss.NewStyle().Width(width).Align(lipgloss.Left).Render(clean))
+		}
+	}
+
+	return out
+}
+
+func clampLines(lines []string, maxRows int) []string {
+	if maxRows <= 0 {
+		return nil
+	}
+
+	if len(lines) <= maxRows {
+		return lines
+	}
+
+	return lines[:maxRows]
+}
+
+func colorizePrefix(line string, prefix string, style lipgloss.Style) string {
+	if !strings.HasPrefix(line, prefix) {
+		return line
+	}
+
+	return style.Render(prefix) + line[len(prefix):]
+}
+
+func isMouseEscapeKey(msg tea.KeyMsg) bool {
+	raw := string(msg.Runes)
+	if raw == "" {
+		return false
+	}
+
+	// xterm mouse tracking escape sequences (SGR and legacy forms) may leak as
+	// text in some terminal/multiplexer combos; drop them from input handling.
+	if strings.HasPrefix(raw, "\x1b[<") && strings.Contains(raw, ";") {
+		if strings.HasSuffix(raw, "M") || strings.HasSuffix(raw, "m") {
+			return true
+		}
+	}
+	if strings.HasPrefix(raw, "\x1b[M") {
+		return true
+	}
+
+	return false
+}
+
+func previewReplyText(text string) string {
+	one := oneLine(text)
+	if one == "" {
+		return "[empty]"
+	}
+	return truncateDisplayWidth(one, 48)
+}
+
+func (m *Model) selectedCurrentMessage() (domains.Message, bool) {
+	messages, ok := m.state.MessagesByChat[m.state.ActiveChatID]
+	if !ok {
+		return domains.Message{}, false
+	}
+
+	idx := m.selectedMessageByChat[m.state.ActiveChatID]
+	return m.conversationUC.SelectedMessage(messages, idx)
+}
+
+func (m *Model) replyTargetMessage() (domains.Message, bool) {
+	messages, ok := m.state.MessagesByChat[m.state.ActiveChatID]
+	if !ok {
+		return domains.Message{}, false
+	}
+
+	replyID, ok := m.replyToMessageByChat[m.state.ActiveChatID]
+	if !ok {
+		return domains.Message{}, false
+	}
+	return m.conversationUC.ResolveReplyTarget(messages, replyID)
+}
+
+func (m *Model) handleMouseClick(mouse tea.MouseMsg) tea.Cmd {
+	leftWidth := max(30, m.width/3)
+	panelHeight := max(12, m.height-6)
+	messagePanelHeight, composerPanelHeight := m.rightPaneHeights(panelHeight)
+	leftContentRows := max(1, panelHeight-2)
+	contentRows := max(1, panelHeight-2)
+
+	panelTopY := 2
+	panelContentTopY := panelTopY + 1
+	panelLeftX := 2
+	panelOuterHeight := panelHeight + 2
+
+	if mouse.Y < panelTopY || mouse.Y >= panelTopY+panelOuterHeight {
+		return nil
+	}
+
+	contentRow := mouse.Y - panelContentTopY
+	if contentRow < 0 {
+		contentRow = 0
+	}
+	if contentRow >= contentRows {
+		contentRow = contentRows - 1
+	}
+
+	if mouse.X >= panelLeftX && mouse.X < panelLeftX+leftWidth {
+		chatIndex, ok := m.chatIndexAtContentRow(contentRow, leftContentRows)
+		if !ok {
+			return nil
+		}
+		if chatIndex >= 0 && chatIndex < len(m.state.Chats) {
+			m.state.ActiveChatID = m.state.Chats[chatIndex].ID
+			m.messageView = false
+			m.messageScroll = 0
+			m.composeInput.Blur()
+			m.state.Status = "Chat selected. Press Enter/Right to open"
+		}
+		return nil
+	}
+
+	rightStartX := panelLeftX + leftWidth
+	if mouse.X < rightStartX {
+		return nil
+	}
+
+	rightPanelTopY := panelTopY
+	messagePanelOuterHeight := messagePanelHeight + 2
+	composerTopY := rightPanelTopY + messagePanelOuterHeight
+	composerPanelOuterHeight := composerPanelHeight + 2
+	if mouse.Y >= composerTopY && mouse.Y < composerTopY+composerPanelOuterHeight {
+		if m.state.Session.Authorized {
+			m.composeInput.Focus()
+			m.state.Status = "Compose message"
+		}
+		return nil
+	}
+
+	if !m.messageView {
+		if m.state.ActiveChatID != 0 && m.client != nil {
+			m.state.Status = "Loading messages"
+			m.state.Error = nil
+			m.composeInput.Focus()
+			return m.loadMessagesForActiveChat()
+		}
+		return nil
+	}
+
+	msgIndex, ok := m.messageIndexAtContentRow(contentRow, messagePanelHeight)
+	if ok {
+		m.selectedMessageByChat[m.state.ActiveChatID] = msgIndex
+		m.state.Status = "Message selected (press Ctrl+r to reply)"
+	}
+
+	return nil
+}
+
+func (m Model) chatIndexAtContentRow(contentRow int, maxRows int) (int, bool) {
+	currentIndex := m.activeChatIndex()
+	return m.navigationUC.ChatIndexAtContentRow(contentRow, maxRows, len(m.state.Chats), currentIndex)
+}
+
+func (m Model) messageIndexAtContentRow(contentRow int, maxRows int) (int, bool) {
+	messages, loaded := m.state.MessagesByChat[m.state.ActiveChatID]
+	if !loaded || len(messages) == 0 {
+		return 0, false
+	}
+
+	rightWidth := max(40, m.width-max(30, m.width/3)-8)
+	messageWidth := max(20, rightWidth-6)
+	hasScrollLine := len(messages) > 1
+	messageRows := max(0, maxRows-1)
+	if hasScrollLine {
+		messageRows = max(0, messageRows-1)
+	}
+	if messageRows <= 0 {
+		return 0, false
+	}
+
+	lineNo := 1 // header row
+
+	end := len(messages) - m.messageScroll
+	if end < 0 {
+		end = 0
+	}
+	if end > len(messages) {
+		end = len(messages)
+	}
+
+	rowsRemaining := messageRows
+	type blockInfo struct {
+		idx   int
+		lines int
+	}
+	blocks := make([]blockInfo, 0, messageRows)
+
+	for i := end - 1; i >= 0 && rowsRemaining > 0; i-- {
+		count := len(renderMessageBlock(messages[i], messageWidth, false))
+		if count == 0 {
+			continue
+		}
+		need := count
+		if len(blocks) > 0 {
+			need++
+		}
+		if need > rowsRemaining {
+			break
+		}
+
+		if len(blocks) > 0 {
+			rowsRemaining--
+		}
+		blocks = append(blocks, blockInfo{idx: i, lines: count})
+		rowsRemaining -= count
+	}
+
+	for i := len(blocks) - 1; i >= 0; i-- {
+		b := blocks[i]
+		for row := 0; row < b.lines; row++ {
+			if contentRow == lineNo {
+				return b.idx, true
+			}
+			lineNo++
+		}
+		if i > 0 {
+			lineNo++ // spacer
+		}
+	}
+
+	return 0, false
+}
+
+func chatEntryStyle(position int, total int) lipgloss.Style {
+	startR, startG, startB := 0x57, 0xd6, 0xd9
+	endR, endG, endB := 0x8e, 0x98, 0xa1
+
+	t := 0.0
+	if total > 1 {
+		t = float64(position) / float64(total-1)
+	}
+
+	// Smoothstep keeps transitions softer than a linear gradient.
+	t = t * t * (3 - 2*t)
+
+	r := int(float64(startR) + (float64(endR-startR) * t))
+	g := int(float64(startG) + (float64(endG-startG) * t))
+	b := int(float64(startB) + (float64(endB-startB) * t))
+
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", r, g, b)))
+}
+
+func (m Model) rightPaneHeights(totalHeight int) (int, int) {
+	if totalHeight < 10 {
+		return max(4, totalHeight-4), 2
+	}
+
+	// totalHeight is content height for one bordered panel. Splitting into two
+	// bordered panels adds one extra border pair, so content heights must sum to
+	// totalHeight-2 to keep outer borders aligned with the left panel.
+	availableContent := totalHeight - 2
+	minMessage := 6
+	minComposer := 3
+
+	composerHeight := 5
+	if composerHeight < minComposer {
+		composerHeight = minComposer
+	}
+	if composerHeight > availableContent-minMessage {
+		composerHeight = max(minComposer, availableContent-minMessage)
+	}
+
+	messageHeight := availableContent - composerHeight
+	if messageHeight < minMessage {
+		messageHeight = minMessage
+		composerHeight = max(minComposer, availableContent-messageHeight)
+	}
+
+	return messageHeight, composerHeight
+}
