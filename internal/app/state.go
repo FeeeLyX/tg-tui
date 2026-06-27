@@ -26,3 +26,16 @@ func NewState() State {
 func (s State) ActiveMessages() []domains.Message {
 	return s.MessagesByChat[s.ActiveChatID]
 }
+
+func ApplyCachedChats(state State, chats []domains.ChatSummary) State {
+	state.Chats = chats
+	if state.ActiveChatID == 0 && len(chats) > 0 {
+		state.ActiveChatID = chats[0].ID
+	}
+	return state
+}
+
+func ApplyCachedMessages(state State, chatID domains.ChatID, messages []domains.Message) State {
+	state.MessagesByChat[chatID] = messages
+	return state
+}
