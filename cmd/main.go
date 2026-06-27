@@ -8,6 +8,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"tg-tui/internal/app"
+	"tg-tui/internal/app/usecase"
+	"tg-tui/internal/ports/inbound"
+	"tg-tui/internal/ports/outbound"
 	"tg-tui/internal/storage"
 	service "tg-tui/internal/telegram"
 	"tg-tui/internal/ui"
@@ -52,76 +55,29 @@ func run() error {
 	}
 	logger.Infof("interactive terminal check passed")
 
-	state := app.NewState()
-	state.Status = "Session bootstrap pending"
-	state.CredentialSummary = config.CredentialSummary()
-	state.CredentialNotice = config.CredentialNotice()
-	var tgClient app.TelegramClient
-
 	logger.Infof("opening cache: %s", config.CachePath)
 	cache, err := storage.OpenCache(config.CachePath)
 	if err != nil {
 		logger.Errorf("open cache failed: %v", err)
-		state.Status = "Cache unavailable, running without local cache"
 	} else {
 		defer cache.Close()
 		logger.Infof("cache opened: %s", config.CachePath)
 	}
 
 	ctx := context.Background()
-	if cache != nil {
-		chats, err := cache.LoadChats(ctx)
-		if err == nil && len(chats) > 0 {
-			state = ui.ApplyCachedChats(state, chats)
-			if state.ActiveChatID != 0 {
-				messages, loadErr := cache.LoadMessages(ctx, state.ActiveChatID)
-				if loadErr == nil {
-					state = ui.ApplyCachedMessages(state, state.ActiveChatID, messages)
-				}
-			}
-			state.Status = "Loaded cached data"
-		}
+
+	var boot inbound.Bootstrapper = usecase.Bootstrapper{
+		NewTelegramClient: func(cfg app.Config) outbound.TelegramClient {
+			return service.NewClient(cfg)
+		},
+		Logger: logger,
 	}
-
-	if err := config.ValidateCredentials(); err != nil {
-		logger.Errorf("credential validation failed: %v", err)
-		state.Error = err
-		state.Status = "Telegram credentials required"
-	} else {
-		logger.Infof("credential validation passed")
-		tgClient = service.NewClient(config)
-		logger.Infof("telegram client start begin")
-		startErr := tgClient.Start(ctx)
-		if startErr != nil {
-			logger.Errorf("telegram client start failed: %v", startErr)
-			state.Error = fmt.Errorf("telegram startup failed: %w", startErr)
-			state.Status = "Telegram startup failed"
-			_ = tgClient.Close()
-			tgClient = nil
-		} else {
-			defer tgClient.Close()
-			logger.Infof("telegram client started")
-
-			session, err := tgClient.Session(ctx)
-			if err != nil {
-				state.Error = err
-				state.Status = "Telegram session bootstrap failed"
-			} else {
-				state.Session = session
-			}
-
-			authState, err := tgClient.AuthState(ctx)
-			if err == nil {
-				state.AuthState = authState
-			}
-			logger.Infof("telegram auth state step: %s", state.AuthState.Step)
-
-			if state.Session.Authorized {
-				state.Status = "Authorized. Chat sync is next."
-			} else {
-				state.Status = "Awaiting Telegram login"
-			}
-		}
+	state, tgClient := boot.Run(ctx, config, cache)
+	if tgClient != nil {
+		defer tgClient.Close()
+	}
+	if cache == nil && state.Error == nil {
+		state.Status = "Cache unavailable, running without local cache"
 	}
 
 	programOptions := []tea.ProgramOption{}
