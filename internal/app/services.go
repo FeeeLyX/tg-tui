@@ -3,7 +3,7 @@ package app
 import (
 	"context"
 
-	"tg-tui/internal/domains"
+	"github.com/FeeeLyX/tg-tui/internal/domains"
 )
 
 type AuthStep string

@@ -1,4 +1,4 @@
-module tg-tui
+module github.com/FeeeLyX/tg-tui
 
 go 1.26.3
 

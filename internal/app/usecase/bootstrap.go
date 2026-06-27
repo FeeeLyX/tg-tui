@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"tg-tui/internal/app"
-	"tg-tui/internal/ports/outbound"
+	"github.com/FeeeLyX/tg-tui/internal/app"
+	"github.com/FeeeLyX/tg-tui/internal/ports/outbound"
 )
 
 type Logger interface {

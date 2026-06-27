@@ -1,6 +1,6 @@
 package outbound
 
-import "tg-tui/internal/app"
+import "github.com/FeeeLyX/tg-tui/internal/app"
 
 type ChatCache = app.ChatCache
 
