@@ -195,6 +195,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if stillPresent {
 				m.state.ActiveChatID = previousActive
+			} else {
+				m.state.ActiveChatID = 0
 			}
 		}
 		if m.state.ActiveChatID == 0 && len(typed.chats) > 0 {
