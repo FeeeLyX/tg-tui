@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"tg-tui/internal/app"
-	"tg-tui/internal/domains"
-	"tg-tui/internal/ports/outbound"
+	"github.com/FeeeLyX/tg-tui/internal/app"
+	"github.com/FeeeLyX/tg-tui/internal/domains"
+	"github.com/FeeeLyX/tg-tui/internal/ports/outbound"
 )
 
 type fakeCache struct {

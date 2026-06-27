@@ -3,7 +3,7 @@ package usecase
 import (
 	"testing"
 
-	"tg-tui/internal/domains"
+	"github.com/FeeeLyX/tg-tui/internal/domains"
 )
 
 func TestConversationMoveSelection_ClampBounds(t *testing.T) {

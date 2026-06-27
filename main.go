@@ -4,23 +4,50 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"tg-tui/internal/app"
-	"tg-tui/internal/app/usecase"
-	"tg-tui/internal/ports/inbound"
-	"tg-tui/internal/ports/outbound"
-	"tg-tui/internal/storage"
-	service "tg-tui/internal/telegram"
-	"tg-tui/internal/ui"
+	"github.com/FeeeLyX/tg-tui/internal/app"
+	"github.com/FeeeLyX/tg-tui/internal/app/usecase"
+	"github.com/FeeeLyX/tg-tui/internal/ports/inbound"
+	"github.com/FeeeLyX/tg-tui/internal/ports/outbound"
+	"github.com/FeeeLyX/tg-tui/internal/storage"
+	service "github.com/FeeeLyX/tg-tui/internal/telegram"
+	"github.com/FeeeLyX/tg-tui/internal/ui"
+)
+
+const defaultVersion = "v0.1.0"
+
+var (
+	version = defaultVersion
+	commit  = "dev"
+	date    = "unknown"
 )
 
 func main() {
+	if shouldPrintVersion(os.Args[1:]) {
+		fmt.Printf("tg-tui %s\n", version)
+		fmt.Printf("commit: %s\n", commit)
+		fmt.Printf("built:  %s\n", date)
+		fmt.Printf("go:     %s\n", runtime.Version())
+		return
+	}
+
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "tg-tui: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func shouldPrintVersion(args []string) bool {
+	for _, arg := range args {
+		if arg == "-version" || arg == "--version" || arg == "version" {
+			return true
+		}
+	}
+
+	return false
 }
 
 func run() error {
@@ -51,7 +78,7 @@ func run() error {
 
 	if (stdinInfo.Mode()&os.ModeCharDevice) == 0 || (stdoutInfo.Mode()&os.ModeCharDevice) == 0 {
 		logger.Errorf("interactive terminal check failed")
-		return fmt.Errorf("tg-tui requires an interactive terminal; run with `go run ./cmd` in a real shell")
+		return fmt.Errorf("tg-tui requires an interactive terminal; run with `go run .` in a real shell")
 	}
 	logger.Infof("interactive terminal check passed")
 

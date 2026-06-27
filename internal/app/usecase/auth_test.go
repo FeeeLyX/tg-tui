@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"tg-tui/internal/app"
-	"tg-tui/internal/domains"
+	"github.com/FeeeLyX/tg-tui/internal/app"
+	"github.com/FeeeLyX/tg-tui/internal/domains"
 )
 
 type fakeAuthClient struct {

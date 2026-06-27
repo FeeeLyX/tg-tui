@@ -14,9 +14,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
 
-	"tg-tui/internal/app"
-	"tg-tui/internal/app/usecase"
-	"tg-tui/internal/domains"
+	"github.com/FeeeLyX/tg-tui/internal/app"
+	"github.com/FeeeLyX/tg-tui/internal/app/usecase"
+	"github.com/FeeeLyX/tg-tui/internal/domains"
 )
 
 var (

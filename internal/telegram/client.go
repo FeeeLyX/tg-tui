@@ -22,8 +22,8 @@ import (
 	"github.com/gotd/td/tgerr"
 	qrcode "rsc.io/qr"
 
-	"tg-tui/internal/app"
-	"tg-tui/internal/domains"
+	"github.com/FeeeLyX/tg-tui/internal/app"
+	"github.com/FeeeLyX/tg-tui/internal/domains"
 )
 
 var ErrNotImplemented = errors.New("telegram operation not implemented yet")

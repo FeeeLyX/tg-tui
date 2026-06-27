@@ -5,8 +5,8 @@ import (
 	"errors"
 	"strings"
 
-	"tg-tui/internal/domains"
-	"tg-tui/internal/ports/outbound"
+	"github.com/FeeeLyX/tg-tui/internal/domains"
+	"github.com/FeeeLyX/tg-tui/internal/ports/outbound"
 )
 
 const (

@@ -1,6 +1,6 @@
 package app
 
-import "tg-tui/internal/domains"
+import "github.com/FeeeLyX/tg-tui/internal/domains"
 
 type State struct {
 	AuthState         AuthState

@@ -10,7 +10,7 @@ import (
 
 	"go.etcd.io/bbolt"
 
-	"tg-tui/internal/domains"
+	"github.com/FeeeLyX/tg-tui/internal/domains"
 )
 
 var (
