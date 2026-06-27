@@ -128,6 +128,7 @@ func run() error {
 	if os.Getenv("TG_TUI_ALT_SCREEN") == "1" {
 		programOptions = append(programOptions, tea.WithAltScreen())
 	}
+	programOptions = append(programOptions, tea.WithMouseCellMotion())
 
 	program := tea.NewProgram(ui.NewModel(state, tgClient), programOptions...)
 	logger.Infof("bubbletea program run start")

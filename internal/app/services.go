@@ -42,7 +42,7 @@ type TelegramClient interface {
 	SubmitPassword(ctx context.Context, password string) (AuthState, error)
 	ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, error)
 	LoadMessages(ctx context.Context, chatID domains.ChatID, limit int) ([]domains.Message, error)
-	SendMessage(ctx context.Context, chatID domains.ChatID, text string) (domains.Message, error)
+	SendMessage(ctx context.Context, chatID domains.ChatID, text string, replyToMessageID int64) (domains.Message, error)
 	Updates() <-chan domains.AppEvent
 	Close() error
 }

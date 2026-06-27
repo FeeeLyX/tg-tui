@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -17,24 +18,27 @@ import (
 )
 
 var (
-	panelStyle        = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
-	headerStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
-	errorStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-	mutedStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	incomingNameStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
-	outgoingNameStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
+	panelStyle           = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
+	headerStyle          = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+	errorStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	mutedStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	incomingNameStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
+	outgoingNameStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
+	selectedMessageStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("11")).Bold(true)
 )
 
 type Model struct {
-	state              app.State
-	client             app.TelegramClient
-	width              int
-	height             int
-	authInput          textinput.Model
-	composeInput       textinput.Model
-	messageView        bool
-	messageScroll      int
-	messageLimitByChat map[domains.ChatID]int
+	state                 app.State
+	client                app.TelegramClient
+	width                 int
+	height                int
+	authInput             textinput.Model
+	composeInput          textinput.Model
+	messageView           bool
+	messageScroll         int
+	messageLimitByChat    map[domains.ChatID]int
+	selectedMessageByChat map[domains.ChatID]int
+	replyToMessageByChat  map[domains.ChatID]int64
 }
 
 type authResultMsg struct {
@@ -44,18 +48,23 @@ type authResultMsg struct {
 }
 
 type chatsLoadedMsg struct {
-	chats []domains.ChatSummary
-	err   error
+	chats  []domains.ChatSummary
+	err    error
+	silent bool
 }
 
 type messagesLoadedMsg struct {
-	chatID        domains.ChatID
-	messages      []domains.Message
-	err           error
-	limit         int
-	preserveTop   bool
-	previousCount int
+	chatID         domains.ChatID
+	messages       []domains.Message
+	err            error
+	limit          int
+	preserveTop    bool
+	previousCount  int
+	preserveScroll bool
+	silent         bool
 }
+
+type refreshTickMsg struct{}
 
 type messageSentMsg struct {
 	chatID  domains.ChatID
@@ -77,18 +86,20 @@ func NewModel(state app.State, client app.TelegramClient) Model {
 	composeInput.Blur()
 
 	return Model{
-		state:              state,
-		client:             client,
-		authInput:          authInput,
-		composeInput:       composeInput,
-		messageLimitByChat: map[domains.ChatID]int{},
+		state:                 state,
+		client:                client,
+		authInput:             authInput,
+		composeInput:          composeInput,
+		messageLimitByChat:    map[domains.ChatID]int{},
+		selectedMessageByChat: map[domains.ChatID]int{},
+		replyToMessageByChat:  map[domains.ChatID]int64{},
 	}
 }
 
 func (m Model) Init() tea.Cmd {
 	if m.state.Session.Authorized && m.client != nil {
 		m.state.Status = "Syncing private chats"
-		return tea.Batch(textinput.Blink, m.loadPrivateChats())
+		return tea.Batch(textinput.Blink, m.loadPrivateChats(), m.scheduleRefresh())
 	}
 
 	return textinput.Blink
@@ -100,6 +111,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = typed.Width
 		m.height = typed.Height
 		return m, nil
+	case refreshTickMsg:
+		if !m.state.Session.Authorized || m.client == nil {
+			return m, m.scheduleRefresh()
+		}
+
+		cmds := []tea.Cmd{m.loadPrivateChatsSilent(), m.scheduleRefresh()}
+		if m.messageView && m.state.ActiveChatID != 0 {
+			cmds = append(cmds, m.refreshActiveMessages())
+		}
+		return m, tea.Batch(cmds...)
+	case tea.MouseMsg:
+		if !m.state.Session.Authorized {
+			return m, nil
+		}
+		if typed.Action != tea.MouseActionPress || typed.Button != tea.MouseButtonLeft {
+			return m, nil
+		}
+		return m, m.handleMouseClick(typed)
 	case authResultMsg:
 		if typed.err != nil {
 			if typed.state.Step != "" {
@@ -144,15 +173,36 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case chatsLoadedMsg:
 		if typed.err != nil {
-			m.state.Error = typed.err
-			m.state.Status = "Authorized, but chat sync failed"
+			if !typed.silent {
+				m.state.Error = typed.err
+				m.state.Status = "Authorized, but chat sync failed"
+			}
 			return m, nil
 		}
 
-		m.state.Error = nil
+		if !typed.silent {
+			m.state.Error = nil
+		}
+		previousActive := m.state.ActiveChatID
 		m.state.Chats = typed.chats
+		if previousActive != 0 {
+			stillPresent := false
+			for _, chat := range typed.chats {
+				if chat.ID == previousActive {
+					stillPresent = true
+					break
+				}
+			}
+			if stillPresent {
+				m.state.ActiveChatID = previousActive
+			}
+		}
 		if m.state.ActiveChatID == 0 && len(typed.chats) > 0 {
 			m.state.ActiveChatID = typed.chats[0].ID
+		}
+
+		if typed.silent {
+			return m, nil
 		}
 
 		if len(typed.chats) == 0 {
@@ -168,14 +218,64 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if typed.err != nil {
-			m.state.Error = typed.err
-			m.state.Status = "Failed to load messages"
+			if !typed.silent {
+				m.state.Error = typed.err
+				m.state.Status = "Failed to load messages"
+			}
 			return m, nil
 		}
 
-		m.state.Error = nil
+		if !typed.silent {
+			m.state.Error = nil
+		}
+		previousMessages := m.state.MessagesByChat[typed.chatID]
+		previousSelectedIndex, hadSelection := m.selectedMessageByChat[typed.chatID]
+		var previousSelectedID int64
+		if hadSelection && previousSelectedIndex >= 0 && previousSelectedIndex < len(previousMessages) {
+			previousSelectedID = previousMessages[previousSelectedIndex].ID
+		}
 		m.state.MessagesByChat[typed.chatID] = typed.messages
 		m.messageLimitByChat[typed.chatID] = typed.limit
+		if current, ok := m.selectedMessageByChat[typed.chatID]; ok && typed.preserveTop {
+			delta := len(typed.messages) - typed.previousCount
+			if delta > 0 {
+				m.selectedMessageByChat[typed.chatID] = current + delta
+			}
+		}
+		if typed.preserveScroll && hadSelection {
+			restored := false
+			if previousSelectedID != 0 {
+				for i := range typed.messages {
+					if typed.messages[i].ID == previousSelectedID {
+						m.selectedMessageByChat[typed.chatID] = i
+						restored = true
+						break
+					}
+				}
+			}
+
+			if !restored {
+				if previousSelectedIndex < 0 {
+					previousSelectedIndex = 0
+				}
+				if len(typed.messages) == 0 {
+					m.selectedMessageByChat[typed.chatID] = 0
+				} else if previousSelectedIndex >= len(typed.messages) {
+					m.selectedMessageByChat[typed.chatID] = len(typed.messages) - 1
+				} else {
+					m.selectedMessageByChat[typed.chatID] = previousSelectedIndex
+				}
+			}
+		} else if _, ok := m.selectedMessageByChat[typed.chatID]; !ok || !typed.preserveTop {
+			if len(typed.messages) > 0 {
+				m.selectedMessageByChat[typed.chatID] = len(typed.messages) - 1
+			} else {
+				m.selectedMessageByChat[typed.chatID] = 0
+			}
+		}
+		if len(typed.messages) > 0 && m.selectedMessageByChat[typed.chatID] >= len(typed.messages) {
+			m.selectedMessageByChat[typed.chatID] = len(typed.messages) - 1
+		}
 		if typed.preserveTop {
 			delta := len(typed.messages) - typed.previousCount
 			if delta > 0 {
@@ -184,10 +284,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if maxScroll := m.maxMessageScroll(); m.messageScroll > maxScroll {
 				m.messageScroll = maxScroll
 			}
+		} else if typed.preserveScroll {
+			if maxScroll := m.maxMessageScroll(); m.messageScroll > maxScroll {
+				m.messageScroll = maxScroll
+			}
 		} else {
 			m.messageScroll = 0
 		}
 		m.messageView = true
+		if typed.silent {
+			return m, nil
+		}
 		if typed.preserveTop {
 			m.state.Status = fmt.Sprintf("Loaded %d older messages", max(0, len(typed.messages)-typed.previousCount))
 			return m, nil
@@ -207,12 +314,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		m.state.Error = nil
 		m.state.MessagesByChat[typed.chatID] = append(m.state.MessagesByChat[typed.chatID], typed.message)
+		m.selectedMessageByChat[typed.chatID] = len(m.state.MessagesByChat[typed.chatID]) - 1
+		delete(m.replyToMessageByChat, typed.chatID)
 		m.composeInput.SetValue("")
 		m.composeInput.Focus()
 		m.messageScroll = 0
 		m.state.Status = "Message sent"
 		return m, nil
 	case tea.KeyMsg:
+		if isMouseEscapeKey(typed) {
+			return m, nil
+		}
+
 		switch typed.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
@@ -220,7 +333,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.state.Session.Authorized {
 				if m.messageView {
 					if m.scrollMessages(1) {
-						m.state.Status = "Scrolling messages"
+						m.state.Status = "Scrolled up"
 						return m, nil
 					}
 
@@ -245,7 +358,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.state.Session.Authorized {
 				if m.messageView {
 					if m.scrollMessages(-1) {
-						m.state.Status = "Scrolling messages"
+						m.state.Status = "Scrolled down"
+					} else {
+						m.state.Status = "Reached newest loaded message"
 					}
 					return m, nil
 				}
@@ -288,7 +403,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state.Error = nil
 				return m, m.beginQRLogin()
 			}
-		case "r":
+		case "ctrl+r":
+			if m.state.Session.Authorized && m.messageView {
+				selected, ok := m.selectedCurrentMessage()
+				if !ok {
+					m.state.Status = "Select a message to reply"
+					return m, nil
+				}
+				m.replyToMessageByChat[m.state.ActiveChatID] = selected.ID
+				m.state.Status = fmt.Sprintf("Replying to: %s", previewReplyText(selected.Text))
+				return m, nil
+			}
+
 			if !m.state.Session.Authorized && m.state.AuthState.Step == app.AuthStepCode {
 				if m.client == nil {
 					m.state.Error = fmt.Errorf("telegram client is not initialized")
@@ -315,7 +441,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 					m.state.Status = "Sending message"
 					m.state.Error = nil
-					return m, m.sendMessage(m.state.ActiveChatID, text)
+					replyTo := m.replyToMessageByChat[m.state.ActiveChatID]
+					return m, m.sendMessage(m.state.ActiveChatID, text, replyTo)
 				}
 
 				m.state.Status = "Loading messages"
@@ -347,6 +474,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state.Status = "Submitting Telegram auth input"
 				m.state.Error = nil
 				return m, m.submitAuth(value)
+			}
+		case "ctrl+u":
+			if m.state.Session.Authorized && m.messageView {
+				delete(m.replyToMessageByChat, m.state.ActiveChatID)
+				m.state.Status = "Reply target cleared"
+				return m, nil
+			}
+		case "ctrl+up":
+			if m.state.Session.Authorized && m.messageView {
+				if m.moveMessageSelection(-1) {
+					m.state.Status = "Message selected"
+				} else {
+					m.state.Status = "Reached oldest message"
+				}
+				return m, nil
+			}
+		case "ctrl+down":
+			if m.state.Session.Authorized && m.messageView {
+				if m.moveMessageSelection(1) {
+					m.state.Status = "Message selected"
+				} else {
+					m.state.Status = "Reached newest message"
+				}
+				return m, nil
 			}
 		}
 	}
@@ -530,7 +681,12 @@ func (m Model) renderMessages(maxRows int) string {
 	lines = append(lines, mutedStyle.Render("Compose"))
 	lines = append(lines, m.composeInput.View())
 	if m.messageView {
-		lines = append(lines, mutedStyle.Render("Message mode: Up/Down to scroll, Enter to send, Esc/Left to return"))
+		if replyID, ok := m.replyToMessageByChat[m.state.ActiveChatID]; ok && replyID > 0 {
+			lines = append(lines, mutedStyle.Render(fmt.Sprintf("Replying to message #%d (Ctrl+r sets target from selected, Ctrl+u clears)", replyID)))
+		} else {
+			lines = append(lines, mutedStyle.Render("Reply: click/select message then press Ctrl+r to set target"))
+		}
+		lines = append(lines, mutedStyle.Render("Message mode: Up/Down scroll, Ctrl+Up/Down select, Enter send, Esc/Left back"))
 	} else {
 		lines = append(lines, mutedStyle.Render("Chat mode: Up/Down to select, Enter/Right to open chat"))
 	}
@@ -672,7 +828,17 @@ func (m Model) loadPrivateChats() tea.Cmd {
 	return func() tea.Msg {
 		ctx := context.Background()
 		chats, err := client.ListPrivateChats(ctx)
-		return chatsLoadedMsg{chats: chats, err: err}
+		return chatsLoadedMsg{chats: chats, err: err, silent: false}
+	}
+}
+
+func (m Model) loadPrivateChatsSilent() tea.Cmd {
+	client := m.client
+
+	return func() tea.Msg {
+		ctx := context.Background()
+		chats, err := client.ListPrivateChats(ctx)
+		return chatsLoadedMsg{chats: chats, err: err, silent: true}
 	}
 }
 
@@ -684,7 +850,26 @@ func (m Model) loadMessagesForActiveChat() tea.Cmd {
 	return func() tea.Msg {
 		ctx := context.Background()
 		messages, err := client.LoadMessages(ctx, chatID, limit)
-		return messagesLoadedMsg{chatID: chatID, messages: messages, err: err, limit: limit}
+		return messagesLoadedMsg{chatID: chatID, messages: messages, err: err, limit: limit, silent: false}
+	}
+}
+
+func (m Model) refreshActiveMessages() tea.Cmd {
+	client := m.client
+	chatID := m.state.ActiveChatID
+	limit := m.messageLimit(chatID)
+
+	return func() tea.Msg {
+		ctx := context.Background()
+		messages, err := client.LoadMessages(ctx, chatID, limit)
+		return messagesLoadedMsg{
+			chatID:         chatID,
+			messages:       messages,
+			err:            err,
+			limit:          limit,
+			preserveScroll: true,
+			silent:         true,
+		}
 	}
 }
 
@@ -708,16 +893,23 @@ func (m Model) loadMoreMessagesForActiveChat() tea.Cmd {
 			limit:         nextLimit,
 			preserveTop:   true,
 			previousCount: len(oldMessages),
+			silent:        false,
 		}
 	}
 }
 
-func (m Model) sendMessage(chatID domains.ChatID, text string) tea.Cmd {
+func (m Model) scheduleRefresh() tea.Cmd {
+	return tea.Tick(5*time.Second, func(time.Time) tea.Msg {
+		return refreshTickMsg{}
+	})
+}
+
+func (m Model) sendMessage(chatID domains.ChatID, text string, replyToMessageID int64) tea.Cmd {
 	client := m.client
 
 	return func() tea.Msg {
 		ctx := context.Background()
-		message, err := client.SendMessage(ctx, chatID, text)
+		message, err := client.SendMessage(ctx, chatID, text, replyToMessageID)
 		return messageSentMsg{chatID: chatID, message: message, err: err}
 	}
 }
@@ -871,6 +1063,93 @@ func (m *Model) scrollMessages(delta int) bool {
 	return true
 }
 
+func (m *Model) moveMessageSelection(delta int) bool {
+	messages, ok := m.state.MessagesByChat[m.state.ActiveChatID]
+	if !ok || len(messages) == 0 {
+		return false
+	}
+
+	current := m.selectedMessageByChat[m.state.ActiveChatID]
+	if current < 0 || current >= len(messages) {
+		current = len(messages) - 1
+	}
+
+	next := current + delta
+	if next < 0 {
+		next = 0
+	}
+	if next >= len(messages) {
+		next = len(messages) - 1
+	}
+
+	if next == current {
+		return false
+	}
+
+	m.selectedMessageByChat[m.state.ActiveChatID] = next
+	m.keepSelectedMessageVisible(len(messages), next)
+	return true
+}
+
+func (m *Model) keepSelectedMessageVisible(totalMessages int, selectedIndex int) {
+	if totalMessages <= 0 {
+		m.messageScroll = 0
+		return
+	}
+
+	visibleCount := m.estimatedVisibleMessageCount()
+	if visibleCount < 1 {
+		visibleCount = 1
+	}
+
+	visibleNewest := totalMessages - 1 - m.messageScroll
+	if visibleNewest < 0 {
+		visibleNewest = 0
+	}
+	visibleOldest := visibleNewest - visibleCount + 1
+	if visibleOldest < 0 {
+		visibleOldest = 0
+	}
+
+	if selectedIndex < visibleOldest {
+		visibleNewest = selectedIndex + visibleCount - 1
+		if visibleNewest > totalMessages-1 {
+			visibleNewest = totalMessages - 1
+		}
+		m.messageScroll = (totalMessages - 1) - visibleNewest
+	}
+
+	if selectedIndex > visibleNewest {
+		m.messageScroll = (totalMessages - 1) - selectedIndex
+	}
+
+	if m.messageScroll < 0 {
+		m.messageScroll = 0
+	}
+	if maxScroll := m.maxMessageScroll(); m.messageScroll > maxScroll {
+		m.messageScroll = maxScroll
+	}
+}
+
+func (m Model) estimatedVisibleMessageCount() int {
+	leftWidth := max(30, m.width/3)
+	rightWidth := max(40, m.width-leftWidth-8)
+	_ = rightWidth
+
+	panelHeight := max(12, m.height-6)
+	contentRows := max(1, panelHeight-2)
+
+	messages, loaded := m.state.MessagesByChat[m.state.ActiveChatID]
+	hasScrollLine := loaded && len(messages) > 1
+	footerRows := 4
+	if hasScrollLine {
+		footerRows++
+	}
+
+	rows := max(1, contentRows-1-footerRows)
+	return rows
+}
+
 func (m Model) messageLimit(chatID domains.ChatID) int {
 	if limit, ok := m.messageLimitByChat[chatID]; ok && limit > 0 {
 		return limit
@@ -915,7 +1194,8 @@ func (m Model) buildMessageViewLines(messages []domains.Message, width int, rowB
 	blocks := make([][]string, 0, rowBudget)
 
 	for i := end - 1; i >= 0 && rowsRemaining > 0; i-- {
-		block := renderMessageBlock(messages[i], width)
+		selected := m.selectedMessageByChat[m.state.ActiveChatID] == i
+		block := renderMessageBlock(messages[i], width, selected)
 		if len(block) == 0 {
 			continue
 		}
@@ -945,7 +1225,7 @@ func (m Model) buildMessageViewLines(messages []domains.Message, width int, rowB
 	return result
 }
 
-func renderMessageBlock(message domains.Message, width int) []string {
+func renderMessageBlock(message domains.Message, width int, selected bool) []string {
 	var name string
 	var nameStyle lipgloss.Style
 	if message.Direction == domains.MessageDirectionOutgoing {
@@ -1003,6 +1283,9 @@ func renderMessageBlock(message domains.Message, width int) []string {
 		if i == 0 && prefixText != "" {
 			clean = colorizePrefix(clean, name+":", nameStyle)
 		}
+		if selected {
+			clean = selectedMessageStyle.Render(clean)
+		}
 		if message.Direction == domains.MessageDirectionOutgoing {
 			out = append(out, lipgloss.NewStyle().Width(width).Align(lipgloss.Right).Render(clean))
 		} else {
@@ -1031,4 +1314,219 @@ func colorizePrefix(line string, prefix string, style lipgloss.Style) string {
 	}
 
 	return style.Render(prefix) + line[len(prefix):]
+}
+
+func isMouseEscapeKey(msg tea.KeyMsg) bool {
+	raw := string(msg.Runes)
+	if raw == "" {
+		return false
+	}
+
+	// xterm mouse tracking escape sequences (SGR and legacy forms) may leak as
+	// text in some terminal/multiplexer combos; drop them from input handling.
+	if strings.HasPrefix(raw, "\x1b[<") && strings.Contains(raw, ";") {
+		if strings.HasSuffix(raw, "M") || strings.HasSuffix(raw, "m") {
+			return true
+		}
+	}
+	if strings.HasPrefix(raw, "\x1b[M") {
+		return true
+	}
+
+	return false
+}
+
+func previewReplyText(text string) string {
+	one := oneLine(text)
+	if one == "" {
+		return "[empty]"
+	}
+	return truncateDisplayWidth(one, 48)
+}
+
+func (m *Model) selectedCurrentMessage() (domains.Message, bool) {
+	messages, ok := m.state.MessagesByChat[m.state.ActiveChatID]
+	if !ok || len(messages) == 0 {
+		return domains.Message{}, false
+	}
+
+	idx := m.selectedMessageByChat[m.state.ActiveChatID]
+	if idx < 0 || idx >= len(messages) {
+		return domains.Message{}, false
+	}
+
+	return messages[idx], true
+}
+
+func (m *Model) handleMouseClick(mouse tea.MouseMsg) tea.Cmd {
+	leftWidth := max(30, m.width/3)
+	panelHeight := max(12, m.height-6)
+	contentRows := max(1, panelHeight-2)
+
+	panelTopY := 2
+	panelContentTopY := panelTopY + 1
+	panelLeftX := 2
+
+	if mouse.Y < panelTopY || mouse.Y >= panelTopY+panelHeight {
+		return nil
+	}
+
+	contentRow := mouse.Y - panelContentTopY
+	if contentRow < 0 {
+		contentRow = 0
+	}
+	if contentRow >= contentRows {
+		contentRow = contentRows - 1
+	}
+
+	if mouse.X >= panelLeftX && mouse.X < panelLeftX+leftWidth {
+		chatIndex, ok := m.chatIndexAtContentRow(contentRow, contentRows)
+		if !ok {
+			return nil
+		}
+		if chatIndex >= 0 && chatIndex < len(m.state.Chats) {
+			m.state.ActiveChatID = m.state.Chats[chatIndex].ID
+			m.messageView = false
+			m.messageScroll = 0
+			m.composeInput.Blur()
+			m.state.Status = "Chat selected. Press Enter/Right to open"
+		}
+		return nil
+	}
+
+	rightStartX := panelLeftX + leftWidth
+	if mouse.X < rightStartX {
+		return nil
+	}
+
+	if !m.messageView {
+		if m.state.ActiveChatID != 0 && m.client != nil {
+			m.state.Status = "Loading messages"
+			m.state.Error = nil
+			m.composeInput.Focus()
+			return m.loadMessagesForActiveChat()
+		}
+		return nil
+	}
+
+	msgIndex, ok := m.messageIndexAtContentRow(contentRow, contentRows)
+	if ok {
+		m.selectedMessageByChat[m.state.ActiveChatID] = msgIndex
+		m.state.Status = "Message selected (press Ctrl+r to reply)"
+	}
+
+	return nil
+}
+
+func (m Model) chatIndexAtContentRow(contentRow int, maxRows int) (int, bool) {
+	if len(m.state.Chats) == 0 {
+		return 0, false
+	}
+
+	currentIndex := m.activeChatIndex()
+	if currentIndex == -1 {
+		currentIndex = 0
+	}
+
+	visibleRows := max(1, maxRows-3)
+	start := currentIndex - visibleRows/2
+	if start < 0 {
+		start = 0
+	}
+	if start+visibleRows > len(m.state.Chats) {
+		start = len(m.state.Chats) - visibleRows
+		if start < 0 {
+			start = 0
+		}
+	}
+	end := start + visibleRows
+	if end > len(m.state.Chats) {
+		end = len(m.state.Chats)
+	}
+
+	lineNo := 0
+	lineNo++ // header
+	if start > 0 {
+		lineNo++ // leading ellipsis row
+	}
+
+	for i := start; i < end; i++ {
+		if contentRow == lineNo {
+			return i, true
+		}
+		lineNo++
+	}
+
+	return 0, false
+}
+
+func (m Model) messageIndexAtContentRow(contentRow int, maxRows int) (int, bool) {
+	messages, loaded := m.state.MessagesByChat[m.state.ActiveChatID]
+	if !loaded || len(messages) == 0 {
+		return 0, false
+	}
+
+	rightWidth := max(40, m.width-max(30, m.width/3)-8)
+	messageWidth := max(20, rightWidth-6)
+	hasScrollLine := len(messages) > 1
+	footerRows := 4
+	if hasScrollLine {
+		footerRows++
+	}
+	messageRows := max(0, maxRows-1-footerRows)
+	if messageRows <= 0 {
+		return 0, false
+	}
+
+	lineNo := 1 // header row
+
+	end := len(messages) - m.messageScroll
+	if end < 0 {
+		end = 0
+	}
+	if end > len(messages) {
+		end = len(messages)
+	}
+
+	rowsRemaining := messageRows
+	type blockInfo struct {
+		idx   int
+		lines int
+	}
+	blocks := make([]blockInfo, 0, messageRows)
+
+	for i := end - 1; i >= 0 && rowsRemaining > 0; i-- {
+		count := len(renderMessageBlock(messages[i], messageWidth, false))
+		if count == 0 {
+			continue
+		}
+		need := count
+		if len(blocks) > 0 {
+			need++
+		}
+		if need > rowsRemaining {
+			break
+		}
+
+		if len(blocks) > 0 {
+			rowsRemaining--
+		}
+		blocks = append(blocks, blockInfo{idx: i, lines: count})
+		rowsRemaining -= count
+	}
+
+	for i := len(blocks) - 1; i >= 0; i-- {
+		b := blocks[i]
+		for row := 0; row < b.lines; row++ {
+			if contentRow == lineNo {
+				return b.idx, true
+			}
+			lineNo++
+		}
+		if i > 0 {
+			lineNo++ // spacer
+		}
+	}
+
+	return 0, false
 }

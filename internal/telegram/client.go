@@ -548,7 +548,7 @@ func (c *Client) LoadMessages(ctx context.Context, chatID domains.ChatID, limit 
 	return messages, nil
 }
 
-func (c *Client) SendMessage(ctx context.Context, chatID domains.ChatID, text string) (domains.Message, error) {
+func (c *Client) SendMessage(ctx context.Context, chatID domains.ChatID, text string, replyToMessageID int64) (domains.Message, error) {
 	if err := c.ensureReady(ctx); err != nil {
 		return domains.Message{}, err
 	}
@@ -584,12 +584,17 @@ func (c *Client) SendMessage(ctx context.Context, chatID domains.ChatID, text st
 	}
 
 	randomID := time.Now().UnixNano()
-	raw := tg.NewClient(c.client)
-	_, err := raw.MessagesSendMessage(c.context(), &tg.MessagesSendMessageRequest{
+	req := &tg.MessagesSendMessageRequest{
 		Peer:     peerInput,
 		Message:  body,
 		RandomID: randomID,
-	})
+	}
+	if replyToMessageID > 0 {
+		req.ReplyTo = &tg.InputReplyToMessage{ReplyToMsgID: int(replyToMessageID)}
+	}
+
+	raw := tg.NewClient(c.client)
+	_, err := raw.MessagesSendMessage(c.context(), req)
 	if err != nil {
 		c.logRPCError("sending message", err)
 		return domains.Message{}, mapAuthError("sending message", err)
