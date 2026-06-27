@@ -25,6 +25,8 @@ var (
 	incomingNameStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
 	outgoingNameStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
 	selectedMessageStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("11")).Bold(true)
+	selectedChatStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
+	chatSeparatorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 )
 
 type Model struct {
@@ -540,11 +542,16 @@ func (m Model) renderBody() string {
 	leftWidth := max(30, m.width/3)
 	rightWidth := max(40, m.width-leftWidth-8)
 	panelHeight := max(12, m.height-6)
-	contentRows := max(1, panelHeight-2)
+	messagePanelHeight, composerPanelHeight := m.rightPaneHeights(panelHeight)
+	messageRows := max(1, messagePanelHeight-2)
+	composerRows := max(1, composerPanelHeight-2)
 
 	return lipgloss.JoinHorizontal(lipgloss.Top,
-		panelStyle.Width(leftWidth).Height(panelHeight).Render(m.renderChats(contentRows)),
-		panelStyle.Width(rightWidth).Height(panelHeight).Render(m.renderMessages(contentRows)),
+		panelStyle.Width(leftWidth).Height(panelHeight).Render(m.renderChats(max(1, panelHeight-2))),
+		lipgloss.JoinVertical(lipgloss.Left,
+			panelStyle.Width(rightWidth).Height(messagePanelHeight).Render(m.renderMessages(messageRows)),
+			panelStyle.Width(rightWidth).Height(composerPanelHeight).Render(m.renderComposer(composerRows)),
+		),
 	)
 }
 
@@ -598,20 +605,20 @@ func (m Model) renderChats(maxRows int) string {
 		m.state.ActiveChatID = m.state.Chats[0].ID
 	}
 
-	visibleRows := max(1, maxRows-3)
+	visibleChats := max(1, (maxRows-2)/2)
 	leftWidth := max(30, m.width/3)
 	contentWidth := max(12, leftWidth-6)
-	start := currentIndex - visibleRows/2
+	start := currentIndex - visibleChats/2
 	if start < 0 {
 		start = 0
 	}
-	if start+visibleRows > len(m.state.Chats) {
-		start = len(m.state.Chats) - visibleRows
+	if start+visibleChats > len(m.state.Chats) {
+		start = len(m.state.Chats) - visibleChats
 		if start < 0 {
 			start = 0
 		}
 	}
-	end := start + visibleRows
+	end := start + visibleChats
 	if end > len(m.state.Chats) {
 		end = len(m.state.Chats)
 	}
@@ -623,7 +630,8 @@ func (m Model) renderChats(maxRows int) string {
 	for i := start; i < end; i++ {
 		chat := m.state.Chats[i]
 		prefix := "  "
-		if chat.ID == m.state.ActiveChatID {
+		isActive := chat.ID == m.state.ActiveChatID
+		if isActive {
 			prefix = "> "
 		}
 
@@ -638,7 +646,17 @@ func (m Model) renderChats(maxRows int) string {
 		}
 
 		entry := truncateDisplayWidth(chat.Title+unread+preview, contentWidth)
+		entryStyle := chatEntryStyle(i-start, max(1, end-start))
+		if isActive {
+			entry = selectedChatStyle.Render(entry)
+		} else {
+			entry = entryStyle.Render(entry)
+		}
 		lines = append(lines, fmt.Sprintf("%s%s", prefix, entry))
+		if i < end-1 {
+			separator := strings.Repeat("·", max(3, contentWidth-2))
+			lines = append(lines, chatSeparatorStyle.Render("  "+separator))
+		}
 	}
 
 	if end < len(m.state.Chats) {
@@ -655,11 +673,10 @@ func (m Model) renderMessages(maxRows int) string {
 
 	messages, loaded := m.state.MessagesByChat[m.state.ActiveChatID]
 	hasScrollLine := loaded && len(messages) > 1
-	footerRows := 4 // blank + compose label + input + mode hint
+	messageRows := max(0, maxRows-1)
 	if hasScrollLine {
-		footerRows++
+		messageRows = max(0, messageRows-1)
 	}
-	messageRows := max(0, maxRows-1-footerRows)
 
 	if !loaded {
 		if m.state.ActiveChatID == 0 {
@@ -679,18 +696,27 @@ func (m Model) renderMessages(maxRows int) string {
 		}
 	}
 
-	lines = append(lines, "")
-	lines = append(lines, mutedStyle.Render("Compose"))
-	lines = append(lines, m.composeInput.View())
-	if m.messageView {
-		if replyID, ok := m.replyToMessageByChat[m.state.ActiveChatID]; ok && replyID > 0 {
-			lines = append(lines, mutedStyle.Render(fmt.Sprintf("Replying to message #%d (Ctrl+r sets target from selected, Ctrl+u clears)", replyID)))
+	return strings.Join(clampLines(lines, maxRows), "\n")
+}
+
+func (m Model) renderComposer(maxRows int) string {
+	lines := []string{headerStyle.Render("Compose")}
+
+	if m.state.Session.Authorized && m.messageView {
+		if replyMessage, ok := m.replyTargetMessage(); ok {
+			lines = append(lines, mutedStyle.Render(fmt.Sprintf("Replying to: %s", previewReplyText(replyMessage.Text))))
 		} else {
-			lines = append(lines, mutedStyle.Render("Reply: click/select message then press Ctrl+r to set target"))
+			lines = append(lines, mutedStyle.Render("Reply target: none - press Ctrl+r on a selected message"))
 		}
-		lines = append(lines, mutedStyle.Render("Message mode: Up/Down scroll, Ctrl+Up/Down select, Enter send, Esc/Left back"))
+		lines = append(lines, m.composeInput.View())
+		lines = append(lines, mutedStyle.Render("Enter sends. Ctrl+u clears reply. Esc/Left returns to chats."))
+	} else if m.state.Session.Authorized {
+		lines = append(lines, mutedStyle.Render("Open a chat to type a message."))
+		lines = append(lines, m.composeInput.View())
+		lines = append(lines, mutedStyle.Render("Enter opens the selected chat."))
 	} else {
-		lines = append(lines, mutedStyle.Render("Chat mode: Up/Down to select, Enter/Right to open chat"))
+		lines = append(lines, mutedStyle.Render("Sign in to compose messages."))
+		lines = append(lines, m.composeInput.View())
 	}
 
 	return strings.Join(clampLines(lines, maxRows), "\n")
@@ -1134,21 +1160,16 @@ func (m *Model) keepSelectedMessageVisible(totalMessages int, selectedIndex int)
 }
 
 func (m Model) estimatedVisibleMessageCount() int {
-	leftWidth := max(30, m.width/3)
-	rightWidth := max(40, m.width-leftWidth-8)
-	_ = rightWidth
-
 	panelHeight := max(12, m.height-6)
-	contentRows := max(1, panelHeight-2)
+	messagePanelHeight, _ := m.rightPaneHeights(panelHeight)
+	contentRows := max(1, messagePanelHeight-2)
 
 	messages, loaded := m.state.MessagesByChat[m.state.ActiveChatID]
 	hasScrollLine := loaded && len(messages) > 1
-	footerRows := 4
+	rows := max(1, contentRows-1)
 	if hasScrollLine {
-		footerRows++
+		rows = max(1, rows-1)
 	}
-
-	rows := max(1, contentRows-1-footerRows)
 	return rows
 }
 
@@ -1246,6 +1267,20 @@ func renderMessageBlock(message domains.Message, width int, selected bool) []str
 		body = "[empty]"
 	}
 
+	replyPreview := ""
+	if message.ReplyToMessageID > 0 {
+		replyText := oneLine(message.ReplyToText)
+		if replyText == "" {
+			replyText = fmt.Sprintf("message #%d", message.ReplyToMessageID)
+		}
+		replySender := oneLine(message.ReplyToSenderName)
+		if replySender != "" {
+			replyPreview = fmt.Sprintf("Reply to %s: %s", replySender, replyText)
+		} else {
+			replyPreview = fmt.Sprintf("Reply to: %s", replyText)
+		}
+	}
+
 	prefixText := name + ": "
 	prefixWidth := lipgloss.Width(prefixText)
 	contentWidth := width - prefixWidth
@@ -1270,7 +1305,10 @@ func renderMessageBlock(message domains.Message, width int, selected bool) []str
 		line = name + ":"
 	}
 
-	rawLines := make([]string, 0, len(bodyLines))
+	rawLines := make([]string, 0, len(bodyLines)+1)
+	if replyPreview != "" {
+		rawLines = append(rawLines, truncateDisplayWidth(replyPreview, width))
+	}
 	rawLines = append(rawLines, line)
 	if len(bodyLines) > 1 {
 		indent := strings.Repeat(" ", prefixWidth)
@@ -1282,7 +1320,9 @@ func renderMessageBlock(message domains.Message, width int, selected bool) []str
 	out := make([]string, 0, len(rawLines))
 	for i, raw := range rawLines {
 		clean := truncateDisplayWidth(raw, width)
-		if i == 0 && prefixText != "" {
+		if i == 0 && replyPreview != "" {
+			clean = mutedStyle.Render(clean)
+		} else if ((i == 0 && replyPreview == "") || (i == 1 && replyPreview != "")) && prefixText != "" {
 			clean = colorizePrefix(clean, name+":", nameStyle)
 		}
 		if selected {
@@ -1360,16 +1400,39 @@ func (m *Model) selectedCurrentMessage() (domains.Message, bool) {
 	return messages[idx], true
 }
 
+func (m *Model) replyTargetMessage() (domains.Message, bool) {
+	messages, ok := m.state.MessagesByChat[m.state.ActiveChatID]
+	if !ok || len(messages) == 0 {
+		return domains.Message{}, false
+	}
+
+	replyID, ok := m.replyToMessageByChat[m.state.ActiveChatID]
+	if !ok || replyID <= 0 {
+		return domains.Message{}, false
+	}
+
+	for i := range messages {
+		if messages[i].ID == replyID {
+			return messages[i], true
+		}
+	}
+
+	return domains.Message{}, false
+}
+
 func (m *Model) handleMouseClick(mouse tea.MouseMsg) tea.Cmd {
 	leftWidth := max(30, m.width/3)
 	panelHeight := max(12, m.height-6)
+	messagePanelHeight, composerPanelHeight := m.rightPaneHeights(panelHeight)
+	leftContentRows := max(1, panelHeight-2)
 	contentRows := max(1, panelHeight-2)
 
 	panelTopY := 2
 	panelContentTopY := panelTopY + 1
 	panelLeftX := 2
+	panelOuterHeight := panelHeight + 2
 
-	if mouse.Y < panelTopY || mouse.Y >= panelTopY+panelHeight {
+	if mouse.Y < panelTopY || mouse.Y >= panelTopY+panelOuterHeight {
 		return nil
 	}
 
@@ -1382,7 +1445,7 @@ func (m *Model) handleMouseClick(mouse tea.MouseMsg) tea.Cmd {
 	}
 
 	if mouse.X >= panelLeftX && mouse.X < panelLeftX+leftWidth {
-		chatIndex, ok := m.chatIndexAtContentRow(contentRow, contentRows)
+		chatIndex, ok := m.chatIndexAtContentRow(contentRow, leftContentRows)
 		if !ok {
 			return nil
 		}
@@ -1401,6 +1464,17 @@ func (m *Model) handleMouseClick(mouse tea.MouseMsg) tea.Cmd {
 		return nil
 	}
 
+	rightPanelTopY := panelTopY
+	messagePanelOuterHeight := messagePanelHeight + 2
+	composerTopY := rightPanelTopY + messagePanelOuterHeight
+	if mouse.Y >= composerTopY && mouse.Y < composerTopY+composerPanelHeight {
+		if m.state.Session.Authorized {
+			m.composeInput.Focus()
+			m.state.Status = "Compose message"
+		}
+		return nil
+	}
+
 	if !m.messageView {
 		if m.state.ActiveChatID != 0 && m.client != nil {
 			m.state.Status = "Loading messages"
@@ -1411,7 +1485,7 @@ func (m *Model) handleMouseClick(mouse tea.MouseMsg) tea.Cmd {
 		return nil
 	}
 
-	msgIndex, ok := m.messageIndexAtContentRow(contentRow, contentRows)
+	msgIndex, ok := m.messageIndexAtContentRow(contentRow, messagePanelHeight)
 	if ok {
 		m.selectedMessageByChat[m.state.ActiveChatID] = msgIndex
 		m.state.Status = "Message selected (press Ctrl+r to reply)"
@@ -1430,18 +1504,18 @@ func (m Model) chatIndexAtContentRow(contentRow int, maxRows int) (int, bool) {
 		currentIndex = 0
 	}
 
-	visibleRows := max(1, maxRows-3)
-	start := currentIndex - visibleRows/2
+	visibleChats := max(1, (maxRows-2)/2)
+	start := currentIndex - visibleChats/2
 	if start < 0 {
 		start = 0
 	}
-	if start+visibleRows > len(m.state.Chats) {
-		start = len(m.state.Chats) - visibleRows
+	if start+visibleChats > len(m.state.Chats) {
+		start = len(m.state.Chats) - visibleChats
 		if start < 0 {
 			start = 0
 		}
 	}
-	end := start + visibleRows
+	end := start + visibleChats
 	if end > len(m.state.Chats) {
 		end = len(m.state.Chats)
 	}
@@ -1457,6 +1531,9 @@ func (m Model) chatIndexAtContentRow(contentRow int, maxRows int) (int, bool) {
 			return i, true
 		}
 		lineNo++
+		if i < end-1 {
+			lineNo++ // separator row
+		}
 	}
 
 	return 0, false
@@ -1471,11 +1548,10 @@ func (m Model) messageIndexAtContentRow(contentRow int, maxRows int) (int, bool)
 	rightWidth := max(40, m.width-max(30, m.width/3)-8)
 	messageWidth := max(20, rightWidth-6)
 	hasScrollLine := len(messages) > 1
-	footerRows := 4
+	messageRows := max(0, maxRows-1)
 	if hasScrollLine {
-		footerRows++
+		messageRows = max(0, messageRows-1)
 	}
-	messageRows := max(0, maxRows-1-footerRows)
 	if messageRows <= 0 {
 		return 0, false
 	}
@@ -1531,4 +1607,52 @@ func (m Model) messageIndexAtContentRow(contentRow int, maxRows int) (int, bool)
 	}
 
 	return 0, false
+}
+
+func chatEntryStyle(position int, total int) lipgloss.Style {
+	startR, startG, startB := 0x57, 0xd6, 0xd9
+	endR, endG, endB := 0x8e, 0x98, 0xa1
+
+	t := 0.0
+	if total > 1 {
+		t = float64(position) / float64(total-1)
+	}
+
+	// Smoothstep keeps transitions softer than a linear gradient.
+	t = t * t * (3 - 2*t)
+
+	r := int(float64(startR) + (float64(endR-startR) * t))
+	g := int(float64(startG) + (float64(endG-startG) * t))
+	b := int(float64(startB) + (float64(endB-startB) * t))
+
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", r, g, b)))
+}
+
+func (m Model) rightPaneHeights(totalHeight int) (int, int) {
+	if totalHeight < 10 {
+		return max(4, totalHeight-4), 2
+	}
+
+	// totalHeight is content height for one bordered panel. Splitting into two
+	// bordered panels adds one extra border pair, so content heights must sum to
+	// totalHeight-2 to keep outer borders aligned with the left panel.
+	availableContent := totalHeight - 2
+	minMessage := 6
+	minComposer := 3
+
+	composerHeight := 5
+	if composerHeight < minComposer {
+		composerHeight = minComposer
+	}
+	if composerHeight > availableContent-minMessage {
+		composerHeight = max(minComposer, availableContent-minMessage)
+	}
+
+	messageHeight := availableContent - composerHeight
+	if messageHeight < minMessage {
+		messageHeight = minMessage
+		composerHeight = max(minComposer, availableContent-messageHeight)
+	}
+
+	return messageHeight, composerHeight
 }
