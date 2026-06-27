@@ -57,6 +57,12 @@ type messagesLoadedMsg struct {
 	previousCount int
 }
 
+type messageSentMsg struct {
+	chatID  domains.ChatID
+	message domains.Message
+	err     error
+}
+
 func NewModel(state app.State, client app.TelegramClient) Model {
 	authInput := textinput.New()
 	authInput.Placeholder = "+123456789"
@@ -68,6 +74,7 @@ func NewModel(state app.State, client app.TelegramClient) Model {
 	composeInput.Placeholder = "Type a message"
 	composeInput.CharLimit = 4096
 	composeInput.Width = 48
+	composeInput.Blur()
 
 	return Model{
 		state:              state,
@@ -108,6 +115,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state.Session = typed.session
 		m.messageView = false
 		m.messageScroll = 0
+		if typed.session.Authorized {
+			m.authInput.Blur()
+			m.composeInput.Focus()
+		} else {
+			m.authInput.Focus()
+			m.composeInput.Blur()
+		}
 		if typed.session.Authorized {
 			m.state.Status = "Authorized. Syncing private chats"
 		} else {
@@ -180,11 +194,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.state.Status = fmt.Sprintf("Loaded %d messages", len(typed.messages))
 		return m, nil
+	case messageSentMsg:
+		if typed.chatID != m.state.ActiveChatID {
+			return m, nil
+		}
+
+		if typed.err != nil {
+			m.state.Error = typed.err
+			m.state.Status = "Failed to send message"
+			return m, nil
+		}
+
+		m.state.Error = nil
+		m.state.MessagesByChat[typed.chatID] = append(m.state.MessagesByChat[typed.chatID], typed.message)
+		m.composeInput.SetValue("")
+		m.composeInput.Focus()
+		m.messageScroll = 0
+		m.state.Status = "Message sent"
+		return m, nil
 	case tea.KeyMsg:
 		switch typed.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
-		case "up", "k":
+		case "up":
 			if m.state.Session.Authorized {
 				if m.messageView {
 					if m.scrollMessages(1) {
@@ -209,7 +241,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
-		case "down", "j":
+		case "down":
 			if m.state.Session.Authorized {
 				if m.messageView {
 					if m.scrollMessages(-1) {
@@ -225,12 +257,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
-		case "esc", "left", "h":
+		case "esc", "left":
 			if m.state.Session.Authorized && m.messageView {
 				m.messageView = false
 				m.messageScroll = 0
+				m.composeInput.Blur()
 				m.state.Status = "Back to chat selection"
 				return m, nil
+			}
+		case "right":
+			if m.state.Session.Authorized && !m.messageView {
+				if m.state.ActiveChatID == 0 || m.client == nil {
+					return m, nil
+				}
+
+				m.state.Status = "Loading messages"
+				m.state.Error = nil
+				m.composeInput.Focus()
+				return m, m.loadMessagesForActiveChat()
 			}
 		case "g":
 			if !m.state.Session.Authorized {
@@ -261,8 +305,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 
+				if m.messageView {
+					m.composeInput.Focus()
+					text := strings.TrimSpace(m.composeInput.Value())
+					if text == "" {
+						m.state.Status = "Type a message to send"
+						return m, nil
+					}
+
+					m.state.Status = "Sending message"
+					m.state.Error = nil
+					return m, m.sendMessage(m.state.ActiveChatID, text)
+				}
+
 				m.state.Status = "Loading messages"
 				m.state.Error = nil
+				m.composeInput.Focus()
 				return m, m.loadMessagesForActiveChat()
 			}
 
@@ -472,9 +530,9 @@ func (m Model) renderMessages(maxRows int) string {
 	lines = append(lines, mutedStyle.Render("Compose"))
 	lines = append(lines, m.composeInput.View())
 	if m.messageView {
-		lines = append(lines, mutedStyle.Render("Message mode: j/k or up/down to scroll, Esc/Left/h to return"))
+		lines = append(lines, mutedStyle.Render("Message mode: Up/Down to scroll, Enter to send, Esc/Left to return"))
 	} else {
-		lines = append(lines, mutedStyle.Render("Chat mode: j/k or up/down to select, Enter to open chat"))
+		lines = append(lines, mutedStyle.Render("Chat mode: Up/Down to select, Enter/Right to open chat"))
 	}
 
 	return strings.Join(clampLines(lines, maxRows), "\n")
@@ -651,6 +709,16 @@ func (m Model) loadMoreMessagesForActiveChat() tea.Cmd {
 			preserveTop:   true,
 			previousCount: len(oldMessages),
 		}
+	}
+}
+
+func (m Model) sendMessage(chatID domains.ChatID, text string) tea.Cmd {
+	client := m.client
+
+	return func() tea.Msg {
+		ctx := context.Background()
+		message, err := client.SendMessage(ctx, chatID, text)
+		return messageSentMsg{chatID: chatID, message: message, err: err}
 	}
 }
 

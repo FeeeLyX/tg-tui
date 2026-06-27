@@ -553,7 +553,56 @@ func (c *Client) SendMessage(ctx context.Context, chatID domains.ChatID, text st
 		return domains.Message{}, err
 	}
 
-	return domains.Message{}, ErrNotImplemented
+	body := strings.TrimSpace(text)
+	if body == "" {
+		return domains.Message{}, errors.New("message text cannot be empty")
+	}
+
+	if err := c.refreshSession(c.context()); err != nil {
+		return domains.Message{}, err
+	}
+
+	c.mu.RLock()
+	authorized := c.session.Authorized
+	peerInput, ok := c.peerByChatID[chatID]
+	c.mu.RUnlock()
+	if !authorized {
+		return domains.Message{}, errors.New("telegram session is not authorized")
+	}
+
+	if !ok {
+		if _, err := c.ListPrivateChats(ctx); err != nil {
+			return domains.Message{}, err
+		}
+
+		c.mu.RLock()
+		peerInput, ok = c.peerByChatID[chatID]
+		c.mu.RUnlock()
+		if !ok {
+			return domains.Message{}, fmt.Errorf("chat %d is unavailable or no longer accessible", chatID)
+		}
+	}
+
+	randomID := time.Now().UnixNano()
+	raw := tg.NewClient(c.client)
+	_, err := raw.MessagesSendMessage(c.context(), &tg.MessagesSendMessageRequest{
+		Peer:     peerInput,
+		Message:  body,
+		RandomID: randomID,
+	})
+	if err != nil {
+		c.logRPCError("sending message", err)
+		return domains.Message{}, mapAuthError("sending message", err)
+	}
+
+	return domains.Message{
+		ID:         randomID,
+		ChatID:     chatID,
+		SenderName: "You",
+		Text:       body,
+		Direction:  domains.MessageDirectionOutgoing,
+		SentAt:     time.Now(),
+	}, nil
 }
 
 func (c *Client) Updates() <-chan domains.AppEvent {
