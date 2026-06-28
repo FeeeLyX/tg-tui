@@ -53,6 +53,8 @@ type Model struct {
 	imageView             bool
 	imageViewTitle        string
 	imageViewContent      string
+	menuOpen              bool
+	menuSelected          int
 	messageScroll         int
 	allChats              []domains.ChatSummary
 	folderScroll          int
@@ -98,6 +100,12 @@ type chatPinToggledMsg struct {
 	chatID domains.ChatID
 	pinned bool
 	err    error
+}
+
+type logoutResultMsg struct {
+	state   app.AuthState
+	session domains.AccountSession
+	err     error
 }
 
 func NewModel(state app.State, client app.TelegramClient) Model {
@@ -202,6 +210,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.authInput.EchoMode = textinput.EchoPassword
 			m.authInput.EchoCharacter = '*'
 		} else {
+			m.authInput.EchoMode = textinput.EchoNormal
+		}
+		// Always reset peek state when leaving password step.
+		if typed.state.Step != app.AuthStepPassword {
 			m.authInput.EchoMode = textinput.EchoNormal
 		}
 
@@ -387,9 +399,71 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.state.Status = "Chat unpinned"
 		}
 		return m, m.loadPrivateChatsSilent()
+	case logoutResultMsg:
+		if typed.err != nil {
+			m.state.Error = userFacingError("Logout", typed.err)
+			m.state.Status = "Logout failed"
+			return m, nil
+		}
+
+		m.state.Error = nil
+		m.state.AuthState = typed.state
+		m.state.Session = typed.session
+		m.state.Folders = []domains.ChatFolder{{ID: 0, Title: "All"}}
+		m.state.ActiveFolderID = 0
+		m.state.Chats = nil
+		m.state.MessagesByChat = map[domains.ChatID][]domains.Message{}
+		m.state.ActiveChatID = 0
+		m.allChats = nil
+		m.messageView = false
+		m.imageView = false
+		m.menuOpen = false
+		m.menuSelected = 0
+		m.messageScroll = 0
+		m.messageLimitByChat = map[domains.ChatID]int{}
+		m.selectedMessageByChat = map[domains.ChatID]int{}
+		m.replyToMessageByChat = map[domains.ChatID]int64{}
+		m.pinOverrideByChat = map[domains.ChatID]bool{}
+		m.authInput.SetValue("")
+		m.authInput.Placeholder = authPlaceholder(typed.state.Step)
+		m.authInput.EchoMode = textinput.EchoNormal
+		m.composeInput.SetValue("")
+		m.composeInput.Blur()
+		m.authInput.Focus()
+		m.state.Status = "Logged out"
+		return m, nil
 	case tea.KeyMsg:
 		if isMouseEscapeKey(typed) {
 			return m, nil
+		}
+		if m.menuOpen {
+			switch typed.String() {
+			case "esc":
+				m.menuOpen = false
+				m.state.Status = "Menu closed"
+				return m, nil
+			case "up":
+				if m.menuSelected > 0 {
+					m.menuSelected--
+				}
+				return m, nil
+			case "down":
+				if m.menuSelected < len(m.menuItems())-1 {
+					m.menuSelected++
+				}
+				return m, nil
+			case "enter":
+				item := m.menuItems()[m.menuSelected]
+				if item == "Logout" {
+					m.menuOpen = false
+					m.state.Status = "Logging out"
+					m.state.Error = nil
+					return m, m.logout()
+				}
+				return m, nil
+			default:
+				return m, nil
+			}
 		}
 		if m.imageView {
 			switch typed.String() {
@@ -459,6 +533,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "esc", "left":
+			if m.state.Session.Authorized && !m.messageView {
+				m.menuOpen = true
+				m.menuSelected = 0
+				m.state.Status = "Menu"
+				return m, nil
+			}
 			if m.state.Session.Authorized && m.imageView {
 				m.imageView = false
 				m.state.Status = "Closed image viewer"
@@ -482,7 +562,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.composeInput.Focus()
 				return m, m.loadMessagesForActiveChat()
 			}
-		case "g":
+		case "ctrl+g":
 			if !m.state.Session.Authorized {
 				if m.client == nil {
 					m.state.Error = fmt.Errorf("telegram credentials are unavailable")
@@ -561,7 +641,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, m.completeQRLogin()
 				}
 
-				value := strings.TrimSpace(m.authInput.Value())
+				var value string
+				if m.state.AuthState.Step == app.AuthStepPassword {
+					// Preserve leading/trailing spaces: they are valid in Telegram 2FA passwords.
+					value = m.authInput.Value()
+				} else {
+					value = strings.TrimSpace(m.authInput.Value())
+				}
 				if value == "" {
 					return m, nil
 				}
@@ -569,6 +655,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state.Status = "Submitting Telegram auth input"
 				m.state.Error = nil
 				return m, m.submitAuth(value)
+			}
+		case "ctrl+v":
+			if !m.state.Session.Authorized && m.state.AuthState.Step == app.AuthStepPassword {
+				if m.authInput.EchoMode == textinput.EchoPassword {
+					m.authInput.EchoMode = textinput.EchoNormal
+					m.state.Status = "Password visible (Ctrl+V to hide)"
+				} else {
+					m.authInput.EchoMode = textinput.EchoPassword
+					m.authInput.EchoCharacter = '*'
+					m.state.Status = "Password hidden"
+				}
+				return m, nil
 			}
 		case "ctrl+u":
 			if m.state.Session.Authorized && m.messageView {
@@ -635,7 +733,11 @@ func (m Model) View() string {
 	if m.imageView {
 		lines = append(lines, m.renderImageViewer(), m.renderStatus())
 	} else {
-		lines = append(lines, m.renderBody(), m.renderStatus())
+		body := m.renderBody()
+		if m.menuOpen {
+			body = m.renderMenuModal()
+		}
+		lines = append(lines, body, m.renderStatus())
 	}
 
 	content := lipgloss.JoinVertical(lipgloss.Left, lines...)
@@ -678,6 +780,42 @@ func (m Model) renderImageViewer() string {
 	}
 
 	return renderFramedPanel(title, "Esc close", width, height, content)
+}
+
+func (m Model) renderMenuOverlay() string {
+	items := m.menuItems()
+	lines := make([]string, 0, len(items))
+	for i, item := range items {
+		prefix := "  "
+		if i == m.menuSelected {
+			prefix = "> "
+			lines = append(lines, selectedChatStyle.Render(prefix+item))
+			continue
+		}
+		lines = append(lines, mutedStyle.Render(prefix+item))
+	}
+
+	content := strings.Join(lines, "\n")
+	return renderFramedPanel("Menu", "Esc close", 24, 6, content)
+}
+
+func (m Model) renderMenuModal() string {
+	width := max(40, m.width-8)
+	height := m.bodyPanelHeight()
+	menu := m.renderMenuOverlay()
+
+	return lipgloss.Place(
+		width,
+		height,
+		lipgloss.Center,
+		lipgloss.Center,
+		menu,
+		lipgloss.WithWhitespaceChars(" "),
+	)
+}
+
+func (m Model) menuItems() []string {
+	return []string{"Logout"}
 }
 
 func (m Model) renderFoldersBox() string {
@@ -747,14 +885,18 @@ func (m Model) renderAuth() string {
 	lines = append(lines, m.authInput.View())
 	lines = append(lines, "")
 	if m.state.AuthState.Step == app.AuthStepQR {
-		lines = append(lines, mutedStyle.Render("Press g to regenerate QR. Press Enter after scanning to verify login."))
+		lines = append(lines, mutedStyle.Render("Press Ctrl+G to regenerate QR. Press Enter after scanning to verify login."))
 	} else if m.state.AuthState.Step == app.AuthStepCode {
 		lines = append(lines, mutedStyle.Render("Press Enter to submit code. Press r to request another code."))
+	} else if m.state.AuthState.Step == app.AuthStepPassword {
+		lines = append(lines, mutedStyle.Render("Press Enter to submit 2FA password. Ctrl+V to toggle visibility."))
 	} else {
-		lines = append(lines, mutedStyle.Render("Press Enter to submit. Press g to switch to QR login."))
+		lines = append(lines, mutedStyle.Render("Press Enter to submit. Press Ctrl+G to switch to QR login."))
 	}
 
-	return renderFramedPanel("Authorization", "Enter submit", max(60, m.width-8), max(12, len(lines)+2), strings.Join(lines, "\n"))
+	content := strings.Join(lines, "\n")
+	height := max(12, lipgloss.Height(content)+2)
+	return renderFramedPanel("Authorization", "Enter submit", max(60, m.width-8), height, content)
 }
 
 func (m Model) renderChats(maxRows int) string {
@@ -908,7 +1050,7 @@ func authPlaceholder(step app.AuthStep) string {
 	case app.AuthStepPassword:
 		return "2FA password"
 	case app.AuthStepQR:
-		return "Press g to generate QR"
+		return "Press Ctrl+G to generate QR"
 	default:
 		return "+123456789"
 	}
@@ -934,6 +1076,17 @@ func (m Model) resendCode() tea.Cmd {
 		defer cancel()
 		nextState, session, err := authUC.ResendCode(ctx)
 		return authResultMsg{state: nextState, session: session, err: err}
+	}
+}
+
+func (m Model) logout() tea.Cmd {
+	authUC := m.authUC
+
+	return func() tea.Msg {
+		ctx, cancel := m.commandContext()
+		defer cancel()
+		nextState, session, err := authUC.Logout(ctx)
+		return logoutResultMsg{state: nextState, session: session, err: err}
 	}
 }
 
@@ -1895,6 +2048,61 @@ func clampAndPadLines(content string, width int, rows int) string {
 	}
 
 	return strings.Join(lines, "\n")
+}
+
+func overlayContent(base string, overlay string) string {
+	baseLines := strings.Split(base, "\n")
+	overlayLines := strings.Split(overlay, "\n")
+	if len(baseLines) == 0 || len(overlayLines) == 0 {
+		return base
+	}
+
+	baseW := 0
+	for _, line := range baseLines {
+		if w := runewidth.StringWidth(line); w > baseW {
+			baseW = w
+		}
+	}
+	overlayW := 0
+	for _, line := range overlayLines {
+		if w := runewidth.StringWidth(line); w > overlayW {
+			overlayW = w
+		}
+	}
+
+	startY := (len(baseLines) - len(overlayLines)) / 2
+	if startY < 0 {
+		startY = 0
+	}
+	startX := (baseW - overlayW) / 2
+	if startX < 0 {
+		startX = 0
+	}
+
+	for i, overlayLine := range overlayLines {
+		y := startY + i
+		if y < 0 || y >= len(baseLines) {
+			continue
+		}
+		baseRunes := []rune(baseLines[y])
+		overlayRunes := []rune(overlayLine)
+
+		if len(baseRunes) < baseW {
+			baseRunes = append(baseRunes, []rune(strings.Repeat(" ", baseW-len(baseRunes)))...)
+		}
+
+		for x := 0; x < len(overlayRunes); x++ {
+			target := startX + x
+			if target < 0 || target >= len(baseRunes) {
+				continue
+			}
+			baseRunes[target] = overlayRunes[x]
+		}
+
+		baseLines[y] = string(baseRunes)
+	}
+
+	return strings.Join(baseLines, "\n")
 }
 
 func (m *Model) handleMouseClick(mouse tea.MouseMsg) tea.Cmd {

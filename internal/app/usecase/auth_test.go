@@ -56,6 +56,7 @@ func (f *fakeAuthClient) SubmitPassword(_ context.Context, password string) (app
 	f.submitPasswordInput = password
 	return f.nextState, f.submitErr
 }
+func (f *fakeAuthClient) Logout(_ context.Context) error { return nil }
 func (f *fakeAuthClient) ListPrivateChats(_ context.Context) ([]domains.ChatSummary, error) {
 	return nil, nil
 }

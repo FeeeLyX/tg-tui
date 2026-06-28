@@ -175,7 +175,9 @@ func (c *Client) SubmitPhone(ctx context.Context, phone string) (app.AuthState, 
 	}
 	c.logf("auth SendCode request: phone=%s", maskPhone(phone))
 
-	sentCode, err := c.authClient().SendCode(c.context(), phone, tgauth.SendCodeOptions{})
+	sentCode, err := c.authClient().SendCode(c.context(), phone, tgauth.SendCodeOptions{
+		AllowAppHash: true,
+	})
 	if err != nil {
 		c.logRPCError("requesting login code", err)
 		return app.AuthState{}, mapAuthError("requesting login code", err)
@@ -442,6 +444,32 @@ func (c *Client) SubmitPassword(ctx context.Context, password string) (app.AuthS
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.authState, nil
+}
+
+func (c *Client) Logout(ctx context.Context) error {
+	if err := c.ensureReady(ctx); err != nil {
+		return err
+	}
+
+	raw := tg.NewClient(c.client)
+	if _, err := raw.AuthLogOut(c.context()); err != nil {
+		c.logRPCError("logging out", err)
+		return mapAuthError("logging out", err)
+	}
+
+	c.mu.Lock()
+	c.phone = ""
+	c.codeHash = ""
+	c.session = domains.AccountSession{Authorized: false, UpdatedAt: time.Now()}
+	c.authState = app.AuthState{
+		Step: app.AuthStepPhone,
+		Hint: "Enter your Telegram phone number to begin login.",
+	}
+	c.peerByChatID = make(map[domains.ChatID]tg.InputPeerClass)
+	c.imageASCIIByKey = make(map[string]imageASCIICache)
+	c.mu.Unlock()
+
+	return nil
 }
 
 func (c *Client) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, error) {
