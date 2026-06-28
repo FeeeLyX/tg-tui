@@ -17,6 +17,11 @@ type AccountSession struct {
 	UpdatedAt  time.Time
 }
 
+type ChatFolder struct {
+	ID    int
+	Title string
+}
+
 type ChatSummary struct {
 	ID              ChatID
 	Title           string
@@ -24,6 +29,9 @@ type ChatSummary struct {
 	LastMessageAt   time.Time
 	UnreadCount     int
 	Pinned          bool
+	FolderID        int
+	FolderIDs       []int
+	FolderTitle     string
 	IsOnline        bool
 }
 

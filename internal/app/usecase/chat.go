@@ -30,6 +30,13 @@ func (u Chat) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, erro
 	return u.client.ListPrivateChats(ctx)
 }
 
+func (u Chat) ListFolders(ctx context.Context) ([]domains.ChatFolder, error) {
+	if u.client == nil {
+		return nil, errors.New("telegram client is not initialized")
+	}
+	return u.client.ListFolders(ctx)
+}
+
 func (u Chat) LoadMessages(ctx context.Context, chatID domains.ChatID, limit int) ([]domains.Message, int, error) {
 	if u.client == nil {
 		return nil, 0, errors.New("telegram client is not initialized")

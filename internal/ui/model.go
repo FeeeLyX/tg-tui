@@ -21,7 +21,6 @@ import (
 )
 
 var (
-	panelStyle           = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
 	headerStyle          = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 	errorStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 	mutedStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
@@ -31,6 +30,8 @@ var (
 	selectedChatStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
 	chatSeparatorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 	pinnedTagStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
+	folderTagStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	activeFolderTagStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("14")).Bold(true)
 )
 
 const commandTimeout = 20 * time.Second
@@ -49,6 +50,8 @@ type Model struct {
 	messageViewUC         usecase.MessageView
 	messageView           bool
 	messageScroll         int
+	allChats              []domains.ChatSummary
+	folderScroll          int
 	messageLimitByChat    map[domains.ChatID]int
 	selectedMessageByChat map[domains.ChatID]int
 	replyToMessageByChat  map[domains.ChatID]int64
@@ -62,9 +65,10 @@ type authResultMsg struct {
 }
 
 type chatsLoadedMsg struct {
-	chats  []domains.ChatSummary
-	err    error
-	silent bool
+	folders []domains.ChatFolder
+	chats   []domains.ChatSummary
+	err     error
+	silent  bool
 }
 
 type messagesLoadedMsg struct {
@@ -115,6 +119,7 @@ func NewModel(state app.State, client app.TelegramClient) Model {
 		conversationUC:        usecase.NewConversation(),
 		navigationUC:          usecase.NewListNavigation(),
 		messageViewUC:         usecase.NewMessageView(),
+		allChats:              append([]domains.ChatSummary(nil), state.Chats...),
 		messageLimitByChat:    map[domains.ChatID]int{},
 		selectedMessageByChat: map[domains.ChatID]int{},
 		replyToMessageByChat:  map[domains.ChatID]int64{},
@@ -217,8 +222,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !typed.silent {
 			m.state.Error = nil
 		}
+		if len(typed.folders) > 0 {
+			m.state.Folders = typed.folders
+		} else {
+			m.state.Folders = []domains.ChatFolder{{ID: 0, Title: "All"}}
+		}
+		if !m.folderExists(m.state.ActiveFolderID) {
+			m.state.ActiveFolderID = 0
+			m.folderScroll = 0
+		}
 		m.reconcilePinOverrides(typed.chats)
-		chats := m.applyPinOverrides(typed.chats)
+		allChats := m.applyPinOverrides(typed.chats)
+		m.allChats = allChats
+		chats := m.filteredChatsForActiveFolder(allChats)
 		previousActive := m.state.ActiveChatID
 		m.state.Chats = chats
 		if previousActive != 0 {
@@ -235,8 +251,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state.ActiveChatID = 0
 			}
 		}
-		if m.state.ActiveChatID == 0 && len(typed.chats) > 0 {
+		if m.state.ActiveChatID == 0 && len(chats) > 0 {
 			m.state.ActiveChatID = chats[0].ID
+		}
+		if !m.chatInCurrentList(previousActive) {
+			m.messageView = false
+			m.messageScroll = 0
 		}
 
 		if typed.silent {
@@ -244,7 +264,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if len(chats) == 0 {
-			m.state.Status = "Authorized. No private chats found"
+			if m.state.ActiveFolderID == 0 {
+				m.state.Status = "Authorized. No private chats found"
+			} else {
+				m.state.Status = fmt.Sprintf("No chats in folder: %s", m.activeFolderTitle())
+			}
 			return m, nil
 		} else {
 			m.state.Status = fmt.Sprintf("Loaded %d private chats", len(chats))
@@ -367,6 +391,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch typed.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
+		case "ctrl+left":
+			if m.state.Session.Authorized && m.selectRelativeFolder(-1) {
+				m.state.Status = fmt.Sprintf("Folder: %s", m.activeFolderTitle())
+				m.state.Error = nil
+				return m, nil
+			}
+		case "ctrl+right":
+			if m.state.Session.Authorized && m.selectRelativeFolder(1) {
+				m.state.Status = fmt.Sprintf("Folder: %s", m.activeFolderTitle())
+				m.state.Error = nil
+				return m, nil
+			}
 		case "up":
 			if m.state.Session.Authorized {
 				if m.messageView {
@@ -571,11 +607,13 @@ func (m Model) View() string {
 		m.height = 32
 	}
 
-	content := lipgloss.JoinVertical(lipgloss.Left,
-		headerStyle.Render("tg-tui"),
-		m.renderBody(),
-		m.renderStatus(),
-	)
+	lines := []string{headerStyle.Render("tg-tui")}
+	if m.state.Session.Authorized {
+		lines = append(lines, m.renderFoldersBox())
+	}
+	lines = append(lines, m.renderBody(), m.renderStatus())
+
+	content := lipgloss.JoinVertical(lipgloss.Left, lines...)
 
 	return lipgloss.NewStyle().Padding(1, 2).Render(content)
 }
@@ -587,18 +625,59 @@ func (m Model) renderBody() string {
 
 	leftWidth := max(30, m.width/3)
 	rightWidth := max(40, m.width-leftWidth-8)
-	panelHeight := max(12, m.height-6)
+	panelHeight := m.bodyPanelHeight()
 	messagePanelHeight, composerPanelHeight := m.rightPaneHeights(panelHeight)
 	messageRows := max(1, messagePanelHeight-2)
 	composerRows := max(1, composerPanelHeight-2)
+	chatRows := max(1, panelHeight-2)
 
 	return lipgloss.JoinHorizontal(lipgloss.Top,
-		panelStyle.Width(leftWidth).Height(panelHeight).Render(m.renderChats(max(1, panelHeight-2))),
+		renderFramedPanel("Chats", "Up/Down, Enter", leftWidth, panelHeight, m.renderChats(chatRows)),
 		lipgloss.JoinVertical(lipgloss.Left,
-			panelStyle.Width(rightWidth).Height(messagePanelHeight).Render(m.renderMessages(messageRows)),
-			panelStyle.Width(rightWidth).Height(composerPanelHeight).Render(m.renderComposer(composerRows)),
+			renderFramedPanel("Messages", "Up/Down, Ctrl+Up/Down", rightWidth, messagePanelHeight, m.renderMessages(messageRows)),
+			renderFramedPanel("Compose", "Enter send, Esc back", rightWidth, composerPanelHeight, m.renderComposer(composerRows)),
 		),
 	)
+}
+
+func (m Model) renderFoldersBox() string {
+	folders := m.state.Folders
+	if len(folders) == 0 {
+		folders = []domains.ChatFolder{{ID: 0, Title: "All"}}
+	}
+
+	availableWidth := max(30, m.width-8)
+	contentWidth := max(12, availableWidth-4)
+
+	start, end, leftCut, rightCut := m.folderWindow(folders, contentWidth)
+
+	parts := make([]string, 0, len(folders)+3)
+	parts = append(parts, mutedStyle.Render("Folders:"))
+	if leftCut {
+		parts = append(parts, mutedStyle.Render("«"))
+	}
+	for i := start; i < end; i++ {
+		folder := folders[i]
+		title := oneLine(folder.Title)
+		if title == "" {
+			title = fmt.Sprintf("Folder %d", folder.ID)
+		}
+		segment := "[" + title + "]"
+		if folder.ID == m.state.ActiveFolderID {
+			segment = activeFolderTagStyle.Render(segment)
+		} else {
+			segment = folderTagStyle.Render(segment)
+		}
+		parts = append(parts, segment)
+	}
+	if rightCut {
+		parts = append(parts, mutedStyle.Render("»"))
+	}
+
+	line := strings.Join(parts, " ")
+	content := lipgloss.NewStyle().Width(contentWidth).Render(line)
+
+	return renderFramedPanel("Folders", "Ctrl+Left/Ctrl+Right", availableWidth, 3, content)
 }
 
 func (m Model) renderAuth() string {
@@ -635,11 +714,11 @@ func (m Model) renderAuth() string {
 		lines = append(lines, mutedStyle.Render("Press Enter to submit. Press g to switch to QR login."))
 	}
 
-	return panelStyle.Width(max(60, m.width-8)).Render(strings.Join(lines, "\n"))
+	return renderFramedPanel("Authorization", "Enter submit", max(60, m.width-8), max(12, len(lines)+2), strings.Join(lines, "\n"))
 }
 
 func (m Model) renderChats(maxRows int) string {
-	lines := []string{headerStyle.Render("Chats")}
+	lines := []string{}
 	if len(m.state.Chats) == 0 {
 		lines = append(lines, mutedStyle.Render("No chats loaded yet."))
 		return strings.Join(clampLines(lines, maxRows), "\n")
@@ -689,6 +768,7 @@ func (m Model) renderChats(maxRows int) string {
 		} else {
 			entry = entryStyle.Render(entry)
 		}
+		entry = lipgloss.NewStyle().Width(contentWidth).MaxWidth(contentWidth).Render(entry)
 		lines = append(lines, fmt.Sprintf("%s%s", prefix, entry))
 		if i < end-1 {
 			separator := strings.Repeat("·", max(3, contentWidth-2))
@@ -704,7 +784,7 @@ func (m Model) renderChats(maxRows int) string {
 }
 
 func (m Model) renderMessages(maxRows int) string {
-	lines := []string{headerStyle.Render("Messages")}
+	lines := []string{}
 	rightWidth := max(40, m.width-max(30, m.width/3)-8)
 	messageWidth := max(20, rightWidth-6)
 
@@ -737,7 +817,7 @@ func (m Model) renderMessages(maxRows int) string {
 }
 
 func (m Model) renderComposer(maxRows int) string {
-	lines := []string{headerStyle.Render("Compose")}
+	lines := []string{}
 
 	if m.state.Session.Authorized && m.messageView {
 		if replyMessage, ok := m.replyTargetMessage(); ok {
@@ -845,8 +925,12 @@ func (m Model) loadPrivateChats() tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := m.commandContext()
 		defer cancel()
+		folders, foldersErr := chatUC.ListFolders(ctx)
 		chats, err := chatUC.ListPrivateChats(ctx)
-		return chatsLoadedMsg{chats: chats, err: err, silent: false}
+		if foldersErr != nil {
+			folders = nil
+		}
+		return chatsLoadedMsg{folders: folders, chats: chats, err: err, silent: false}
 	}
 }
 
@@ -856,8 +940,12 @@ func (m Model) loadPrivateChatsSilent() tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := m.commandContext()
 		defer cancel()
+		folders, foldersErr := chatUC.ListFolders(ctx)
 		chats, err := chatUC.ListPrivateChats(ctx)
-		return chatsLoadedMsg{chats: chats, err: err, silent: true}
+		if foldersErr != nil {
+			folders = nil
+		}
+		return chatsLoadedMsg{folders: folders, chats: chats, err: err, silent: true}
 	}
 }
 
@@ -972,6 +1060,187 @@ func (m *Model) activeChatIndex() int {
 	return m.navigationUC.ActiveIndex(m.state.Chats, m.state.ActiveChatID)
 }
 
+func (m *Model) selectRelativeFolder(delta int) bool {
+	folders := m.state.Folders
+	if len(folders) == 0 {
+		folders = []domains.ChatFolder{{ID: 0, Title: "All"}}
+		m.state.Folders = folders
+	}
+
+	current := 0
+	for i := range folders {
+		if folders[i].ID == m.state.ActiveFolderID {
+			current = i
+			break
+		}
+	}
+
+	next := current + delta
+	if next < 0 {
+		next = 0
+	}
+	if next >= len(folders) {
+		next = len(folders) - 1
+	}
+	if next == current {
+		return false
+	}
+
+	m.state.ActiveFolderID = folders[next].ID
+	m.folderScroll = next
+	m.state.Chats = m.filteredChatsForActiveFolder(m.allChats)
+	if !m.chatInCurrentList(m.state.ActiveChatID) {
+		if len(m.state.Chats) > 0 {
+			m.state.ActiveChatID = m.state.Chats[0].ID
+		} else {
+			m.state.ActiveChatID = 0
+		}
+		m.messageView = false
+		m.messageScroll = 0
+	}
+
+	return true
+}
+
+func (m Model) folderExists(folderID int) bool {
+	for _, folder := range m.state.Folders {
+		if folder.ID == folderID {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (m Model) folderWindow(folders []domains.ChatFolder, width int) (start int, end int, leftCut bool, rightCut bool) {
+	if len(folders) == 0 {
+		return 0, 0, false, false
+	}
+
+	if m.folderScroll < 0 {
+		start = 0
+	} else if m.folderScroll >= len(folders) {
+		start = len(folders) - 1
+	} else {
+		start = m.folderScroll
+	}
+
+	used := lipgloss.Width("Folders:") + 1
+	end = start
+	for end < len(folders) {
+		title := oneLine(folders[end].Title)
+		if title == "" {
+			title = fmt.Sprintf("Folder %d", folders[end].ID)
+		}
+		segmentWidth := lipgloss.Width("["+title+"]") + 1
+		if used+segmentWidth > width {
+			break
+		}
+		used += segmentWidth
+		end++
+	}
+
+	if end == start {
+		end = start + 1
+		if end > len(folders) {
+			end = len(folders)
+		}
+	}
+
+	leftCut = start > 0
+	rightCut = end < len(folders)
+	return start, end, leftCut, rightCut
+}
+
+func (m Model) activeFolderTitle() string {
+	for _, folder := range m.state.Folders {
+		if folder.ID == m.state.ActiveFolderID {
+			return folder.Title
+		}
+	}
+	return "All"
+}
+
+func (m *Model) syncFoldersFromChats(chats []domains.ChatSummary) {
+	folderTitles := map[int]string{0: "All"}
+	for _, chat := range chats {
+		title := strings.TrimSpace(chat.FolderTitle)
+		if title == "" {
+			if chat.FolderID == 0 {
+				title = "All"
+			} else {
+				title = fmt.Sprintf("Folder %d", chat.FolderID)
+			}
+		}
+		folderTitles[chat.FolderID] = title
+	}
+
+	folders := make([]domains.ChatFolder, 0, len(folderTitles))
+	for id, title := range folderTitles {
+		folders = append(folders, domains.ChatFolder{ID: id, Title: title})
+	}
+
+	sort.SliceStable(folders, func(i, j int) bool {
+		if folders[i].ID == 0 {
+			return true
+		}
+		if folders[j].ID == 0 {
+			return false
+		}
+		return folders[i].ID < folders[j].ID
+	})
+
+	m.state.Folders = folders
+	found := false
+	for _, folder := range folders {
+		if folder.ID == m.state.ActiveFolderID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		m.state.ActiveFolderID = 0
+	}
+}
+
+func (m Model) filteredChatsForActiveFolder(chats []domains.ChatSummary) []domains.ChatSummary {
+	if m.state.ActiveFolderID == 0 {
+		out := make([]domains.ChatSummary, len(chats))
+		copy(out, chats)
+		return out
+	}
+
+	out := make([]domains.ChatSummary, 0, len(chats))
+	for _, chat := range chats {
+		if chatInFolder(chat, m.state.ActiveFolderID) {
+			out = append(out, chat)
+		}
+	}
+	return out
+}
+
+func chatInFolder(chat domains.ChatSummary, folderID int) bool {
+	for _, id := range chat.FolderIDs {
+		if id == folderID {
+			return true
+		}
+	}
+
+	return chat.FolderID == folderID
+}
+
+func (m Model) chatInCurrentList(chatID domains.ChatID) bool {
+	if chatID == 0 {
+		return false
+	}
+	for _, chat := range m.state.Chats {
+		if chat.ID == chatID {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Model) selectRelativeChat(delta int) bool {
 	nextID, changed := m.navigationUC.SelectRelative(m.state.Chats, m.state.ActiveChatID, delta)
 	if !changed {
@@ -1046,6 +1315,12 @@ func oneLine(value string) string {
 		// Strip control characters that can break terminal layout.
 		if unicode.IsControl(r) {
 			return -1
+		}
+
+		// Convert zero-width formatting runes (for example ZWSP/LRM/RLM)
+		// into normal spaces so words don't visually collapse.
+		if unicode.Is(unicode.Cf, r) {
+			return ' '
 		}
 
 		// Strip emoji and emoji-related joiner/selector runes because some
@@ -1166,7 +1441,7 @@ func (m *Model) keepSelectedMessageVisible(totalMessages int, selectedIndex int)
 }
 
 func (m Model) estimatedVisibleMessageCount() int {
-	panelHeight := max(12, m.height-6)
+	panelHeight := m.bodyPanelHeight()
 	messagePanelHeight, _ := m.rightPaneHeights(panelHeight)
 	contentRows := max(1, messagePanelHeight-2)
 
@@ -1200,6 +1475,23 @@ func (m Model) canLoadOlderMessages() bool {
 
 	// If server returned fewer than requested, there is likely no older page left.
 	return len(messages) >= limit
+}
+
+func (m Model) folderBoxHeight() int {
+	if !m.state.Session.Authorized {
+		return 0
+	}
+
+	return max(1, lipgloss.Height(m.renderFoldersBox()))
+}
+
+func (m Model) bodyPanelHeight() int {
+	extraRows := 0
+	if m.state.Session.Authorized {
+		extraRows = max(0, m.folderBoxHeight()-1)
+	}
+
+	return max(12, m.height-6-extraRows)
 }
 
 func (m Model) buildMessageViewLines(messages []domains.Message, width int, rowBudget int) []string {
@@ -1313,28 +1605,31 @@ func renderMessageBlock(message domains.Message, width int, selected bool) []str
 	}
 	rawLines = append(rawLines, line)
 	if len(bodyLines) > 1 {
-		indent := strings.Repeat(" ", prefixWidth)
+		indent := ""
+		if message.Direction != domains.MessageDirectionOutgoing {
+			indent = strings.Repeat(" ", prefixWidth)
+		}
 		for _, rest := range bodyLines[1:] {
 			rawLines = append(rawLines, indent+rest)
 		}
 	}
 
 	out := make([]string, 0, len(rawLines))
+	align := lipgloss.Left
+	if message.Direction == domains.MessageDirectionOutgoing {
+		align = lipgloss.Right
+	}
 	for i, raw := range rawLines {
 		clean := truncateDisplayWidth(raw, width)
 		if i == 0 && replyPreview != "" {
 			clean = mutedStyle.Render(clean)
 		} else if ((i == 0 && replyPreview == "") || (i == 1 && replyPreview != "")) && prefixText != "" {
-			clean = colorizePrefix(clean, name+":", nameStyle)
+			clean = colorizePrefix(clean, name+":", nameStyle, selected)
 		}
-		if selected {
-			clean = selectedMessageStyle.Render(clean)
-		}
-		if message.Direction == domains.MessageDirectionOutgoing {
-			out = append(out, lipgloss.NewStyle().Width(width).Align(lipgloss.Right).Render(clean))
-		} else {
-			out = append(out, lipgloss.NewStyle().Width(width).Align(lipgloss.Left).Render(clean))
-		}
+
+		aligned := lipgloss.NewStyle().Width(width).Align(align).Render(clean)
+
+		out = append(out, aligned)
 	}
 
 	return out
@@ -1352,12 +1647,76 @@ func clampLines(lines []string, maxRows int) []string {
 	return lines[:maxRows]
 }
 
-func colorizePrefix(line string, prefix string, style lipgloss.Style) string {
+func colorizePrefix(line string, prefix string, style lipgloss.Style, selected bool) string {
 	if !strings.HasPrefix(line, prefix) {
 		return line
 	}
+	prefixStyle := style
+	if selected {
+		prefixStyle = selectedMessageStyle
+	}
 
-	return style.Render(prefix) + line[len(prefix):]
+	return prefixStyle.Render(prefix) + line[len(prefix):]
+}
+
+func renderFramedPanel(title string, hint string, width int, height int, content string) string {
+	if width < 8 {
+		width = 8
+	}
+	if height < 3 {
+		height = 3
+	}
+
+	innerWidth := width - 2
+	contentWidth := max(1, width-4)
+	bodyRows := max(1, height-2)
+
+	top := "╭" + frameTopInner(title, hint, innerWidth) + "╮"
+	bottom := "╰" + strings.Repeat("─", innerWidth) + "╯"
+
+	lines := strings.Split(content, "\n")
+	body := make([]string, 0, bodyRows)
+	for i := 0; i < bodyRows; i++ {
+		line := ""
+		if i < len(lines) {
+			line = lines[i]
+		}
+		inner := lipgloss.NewStyle().Width(contentWidth).MaxWidth(contentWidth).Render(line)
+		body = append(body, "│ "+inner+" │")
+	}
+
+	return strings.Join(append(append([]string{top}, body...), bottom), "\n")
+}
+
+func frameTopInner(title string, hint string, width int) string {
+	titleText := " " + oneLine(title) + " "
+	hintText := ""
+	if strings.TrimSpace(hint) != "" {
+		hintText = " " + oneLine(hint) + " "
+	}
+
+	if runewidth.StringWidth(titleText) > width {
+		titleText = " " + truncateDisplayWidth(title, max(1, width-2)) + " "
+	}
+
+	availableForHint := width - runewidth.StringWidth(titleText) - 1
+	if availableForHint < 0 {
+		availableForHint = 0
+	}
+	if runewidth.StringWidth(hintText) > availableForHint {
+		if availableForHint >= 2 {
+			hintText = " " + truncateDisplayWidth(hint, availableForHint-2) + " "
+		} else {
+			hintText = ""
+		}
+	}
+
+	fill := width - runewidth.StringWidth(titleText) - runewidth.StringWidth(hintText)
+	if fill < 0 {
+		fill = 0
+	}
+
+	return titleText + strings.Repeat("─", fill) + hintText
 }
 
 func isMouseEscapeKey(msg tea.KeyMsg) bool {
@@ -1413,12 +1772,15 @@ func (m *Model) replyTargetMessage() (domains.Message, bool) {
 
 func (m *Model) handleMouseClick(mouse tea.MouseMsg) tea.Cmd {
 	leftWidth := max(30, m.width/3)
-	panelHeight := max(12, m.height-6)
+	panelHeight := m.bodyPanelHeight()
 	messagePanelHeight, composerPanelHeight := m.rightPaneHeights(panelHeight)
 	leftContentRows := max(1, panelHeight-2)
 	contentRows := max(1, panelHeight-2)
 
 	panelTopY := 2
+	if m.state.Session.Authorized {
+		panelTopY = 3 + max(0, m.folderBoxHeight()-1)
+	}
 	panelContentTopY := panelTopY + 1
 	panelLeftX := 2
 	panelOuterHeight := panelHeight + 2
@@ -1582,15 +1944,14 @@ func chatEntryStyle(position int, total int) lipgloss.Style {
 
 func (m Model) rightPaneHeights(totalHeight int) (int, int) {
 	if totalHeight < 10 {
-		return max(4, totalHeight-4), 2
+		return max(6, totalHeight-4), 4
 	}
 
-	// totalHeight is content height for one bordered panel. Splitting into two
-	// bordered panels adds one extra border pair, so content heights must sum to
-	// totalHeight-2 to keep outer borders aligned with the left panel.
-	availableContent := totalHeight - 2
+	// renderFramedPanel consumes exact height, including borders. To keep the
+	// right stack aligned with the left panel, split must sum to totalHeight.
+	availableContent := totalHeight
 	minMessage := 6
-	minComposer := 3
+	minComposer := 4
 
 	composerHeight := 5
 	if composerHeight < minComposer {

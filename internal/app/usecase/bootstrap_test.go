@@ -64,6 +64,9 @@ func (f *fakeTelegramClient) SubmitPassword(_ context.Context, _ string) (app.Au
 func (f *fakeTelegramClient) ListPrivateChats(_ context.Context) ([]domains.ChatSummary, error) {
 	return nil, nil
 }
+func (f *fakeTelegramClient) ListFolders(_ context.Context) ([]domains.ChatFolder, error) {
+	return []domains.ChatFolder{{ID: 0, Title: "All"}}, nil
+}
 func (f *fakeTelegramClient) LoadMessages(_ context.Context, _ domains.ChatID, _ int) ([]domains.Message, error) {
 	return nil, nil
 }
