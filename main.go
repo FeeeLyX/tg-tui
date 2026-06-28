@@ -64,7 +64,8 @@ func run() error {
 
 	logger.Infof("startup begin")
 	logger.Infof("credential source: %s", config.CredentialSource)
-	logger.Infof("alt screen enabled: %t", os.Getenv("TG_TUI_ALT_SCREEN") == "1")
+	altScreenEnabled := os.Getenv("TG_TUI_ALT_SCREEN") != "0"
+	logger.Infof("alt screen enabled: %t", altScreenEnabled)
 	logger.Infof("term env: TERM=%q COLORTERM=%q", os.Getenv("TERM"), os.Getenv("COLORTERM"))
 
 	stdinInfo, stdinErr := os.Stdin.Stat()
@@ -108,7 +109,7 @@ func run() error {
 	}
 
 	programOptions := []tea.ProgramOption{}
-	if os.Getenv("TG_TUI_ALT_SCREEN") == "1" {
+	if altScreenEnabled {
 		programOptions = append(programOptions, tea.WithAltScreen())
 	}
 	programOptions = append(programOptions, tea.WithMouseCellMotion())

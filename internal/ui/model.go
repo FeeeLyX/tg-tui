@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -49,6 +50,9 @@ type Model struct {
 	navigationUC          usecase.ListNavigation
 	messageViewUC         usecase.MessageView
 	messageView           bool
+	imageView             bool
+	imageViewTitle        string
+	imageViewContent      string
 	messageScroll         int
 	allChats              []domains.ChatSummary
 	folderScroll          int
@@ -387,10 +391,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if isMouseEscapeKey(typed) {
 			return m, nil
 		}
+		if m.imageView {
+			switch typed.String() {
+			case "esc", "left", "q", "ctrl+c":
+				// handled below
+			default:
+				return m, nil
+			}
+		}
 
 		switch typed.String() {
 		case "ctrl+c", "q":
-			return m, tea.Quit
+			return m, quitAndClearCmd()
 		case "ctrl+left":
 			if m.state.Session.Authorized && m.selectRelativeFolder(-1) {
 				m.state.Status = fmt.Sprintf("Folder: %s", m.activeFolderTitle())
@@ -447,6 +459,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "esc", "left":
+			if m.state.Session.Authorized && m.imageView {
+				m.imageView = false
+				m.state.Status = "Closed image viewer"
+				return m, nil
+			}
 			if m.state.Session.Authorized && m.messageView {
 				m.messageView = false
 				m.messageScroll = 0
@@ -509,6 +526,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.composeInput.Focus()
 					text := strings.TrimSpace(m.composeInput.Value())
 					if text == "" {
+						if selected, ok := m.selectedCurrentMessage(); ok && selected.HasImage {
+							m.openImageViewer(selected)
+							return m, nil
+						}
 						m.state.Status = "Type a message to send"
 						return m, nil
 					}
@@ -611,7 +632,11 @@ func (m Model) View() string {
 	if m.state.Session.Authorized {
 		lines = append(lines, m.renderFoldersBox())
 	}
-	lines = append(lines, m.renderBody(), m.renderStatus())
+	if m.imageView {
+		lines = append(lines, m.renderImageViewer(), m.renderStatus())
+	} else {
+		lines = append(lines, m.renderBody(), m.renderStatus())
+	}
 
 	content := lipgloss.JoinVertical(lipgloss.Left, lines...)
 
@@ -638,6 +663,21 @@ func (m Model) renderBody() string {
 			renderFramedPanel("Compose", "Enter send, Esc back", rightWidth, composerPanelHeight, m.renderComposer(composerRows)),
 		),
 	)
+}
+
+func (m Model) renderImageViewer() string {
+	width := max(60, m.width-8)
+	height := m.bodyPanelHeight()
+	bodyRows := max(1, height-2)
+	contentWidth := max(20, width-4)
+
+	content := clampAndPadLines(m.imageViewContent, contentWidth, bodyRows)
+	title := m.imageViewTitle
+	if title == "" {
+		title = "Image Viewer"
+	}
+
+	return renderFramedPanel(title, "Esc close", width, height, content)
 }
 
 func (m Model) renderFoldersBox() string {
@@ -1383,6 +1423,30 @@ func truncateDisplayWidth(value string, maxWidth int) string {
 	return runewidth.Truncate(clean, maxWidth, "…")
 }
 
+func truncateRawDisplayWidth(value string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+
+	clean := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) && r != '\t' {
+			return -1
+		}
+		return r
+	}, value)
+	return runewidth.Truncate(clean, maxWidth, "…")
+}
+
+func fitANSILine(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+
+	// MaxWidth is ANSI-aware and preserves escape sequences. Keep natural width
+	// so caller alignment (left/right) can position the line correctly.
+	return lipgloss.NewStyle().MaxWidth(width).Render(value)
+}
+
 func (m Model) maxMessageScroll() int {
 	messages, ok := m.state.MessagesByChat[m.state.ActiveChatID]
 	if !ok {
@@ -1599,9 +1663,16 @@ func renderMessageBlock(message domains.Message, width int, selected bool) []str
 		line = name + ":"
 	}
 
-	rawLines := make([]string, 0, len(bodyLines)+1)
+	rawLines := make([]string, 0, len(bodyLines)+12)
 	if replyPreview != "" {
 		rawLines = append(rawLines, truncateDisplayWidth(replyPreview, width))
+	}
+	if message.HasImage {
+		rawLines = append(rawLines, truncateRawDisplayWidth("[image] click or Enter to open", width))
+		previewLines := strings.Split(message.ImagePreviewASCII, "\n")
+		for _, p := range previewLines {
+			rawLines = append(rawLines, p)
+		}
 	}
 	rawLines = append(rawLines, line)
 	if len(bodyLines) > 1 {
@@ -1621,6 +1692,9 @@ func renderMessageBlock(message domains.Message, width int, selected bool) []str
 	}
 	for i, raw := range rawLines {
 		clean := truncateDisplayWidth(raw, width)
+		if strings.Contains(raw, "\x1b[") {
+			clean = fitANSILine(raw, width)
+		}
 		if i == 0 && replyPreview != "" {
 			clean = mutedStyle.Render(clean)
 		} else if ((i == 0 && replyPreview == "") || (i == 1 && replyPreview != "")) && prefixText != "" {
@@ -1719,6 +1793,13 @@ func frameTopInner(title string, hint string, width int) string {
 	return titleText + strings.Repeat("─", fill) + hintText
 }
 
+func quitAndClearCmd() tea.Cmd {
+	return func() tea.Msg {
+		_, _ = fmt.Fprint(os.Stdout, "\x1b[H\x1b[2J")
+		return tea.QuitMsg{}
+	}
+}
+
 func isMouseEscapeKey(msg tea.KeyMsg) bool {
 	raw := string(msg.Runes)
 	if raw == "" {
@@ -1770,7 +1851,59 @@ func (m *Model) replyTargetMessage() (domains.Message, bool) {
 	return m.conversationUC.ResolveReplyTarget(messages, replyID)
 }
 
+func (m *Model) openImageViewer(message domains.Message) {
+	title := "Image"
+	if message.Direction == domains.MessageDirectionOutgoing {
+		title = "You"
+	} else {
+		sender := oneLine(message.SenderName)
+		if sender != "" {
+			title = sender
+		}
+	}
+
+	content := strings.TrimSpace(message.ImageFullASCII)
+	if content == "" {
+		content = "[image unavailable]"
+	}
+
+	m.imageView = true
+	m.imageViewTitle = title + " image"
+	m.imageViewContent = content
+	m.state.Status = "Opened image viewer (Esc to close)"
+}
+
+func clampAndPadLines(content string, width int, rows int) string {
+	if width <= 0 || rows <= 0 {
+		return ""
+	}
+
+	source := strings.Split(content, "\n")
+	lines := make([]string, 0, rows)
+	for _, line := range source {
+		if len(lines) >= rows {
+			break
+		}
+		clean := truncateRawDisplayWidth(line, width)
+		if strings.Contains(line, "\x1b[") {
+			clean = fitANSILine(line, width)
+		}
+		lines = append(lines, clean)
+	}
+	for len(lines) < rows {
+		lines = append(lines, "")
+	}
+
+	return strings.Join(lines, "\n")
+}
+
 func (m *Model) handleMouseClick(mouse tea.MouseMsg) tea.Cmd {
+	if m.imageView {
+		m.imageView = false
+		m.state.Status = "Closed image viewer"
+		return nil
+	}
+
 	leftWidth := max(30, m.width/3)
 	panelHeight := m.bodyPanelHeight()
 	messagePanelHeight, composerPanelHeight := m.rightPaneHeights(panelHeight)
@@ -1842,7 +1975,12 @@ func (m *Model) handleMouseClick(mouse tea.MouseMsg) tea.Cmd {
 	msgIndex, ok := m.messageIndexAtContentRow(contentRow, messagePanelHeight)
 	if ok {
 		m.selectedMessageByChat[m.state.ActiveChatID] = msgIndex
-		m.state.Status = "Message selected (press Ctrl+r to reply)"
+		selected := m.state.MessagesByChat[m.state.ActiveChatID][msgIndex]
+		if selected.HasImage {
+			m.openImageViewer(selected)
+		} else {
+			m.state.Status = "Message selected (press Ctrl+r to reply)"
+		}
 	}
 
 	return nil
