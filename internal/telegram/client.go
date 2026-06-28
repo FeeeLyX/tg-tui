@@ -447,6 +447,10 @@ func (c *Client) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, e
 	}
 
 	raw := tg.NewClient(c.client)
+	folders, folderTitles, filterDefs := c.loadDialogFilters(raw)
+	if len(folders) == 0 {
+		folders = []domains.ChatFolder{{ID: 0, Title: "All"}}
+	}
 	iter := query.GetDialogs(raw).BatchSize(100).Iter()
 
 	chats := make([]domains.ChatSummary, 0, 64)
@@ -469,6 +473,8 @@ func (c *Client) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, e
 		}
 
 		lastText, lastAt := extractLastMessage(elem.Last)
+		folderIDs := c.matchCustomFolderIDs(user, elem.Dialog, folders, filterDefs)
+		folderID := firstFolderID(folderIDs)
 		chat := domains.ChatSummary{
 			ID:              domains.ChatID(user.ID),
 			Title:           privateChatTitle(user),
@@ -476,6 +482,9 @@ func (c *Client) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, e
 			LastMessageAt:   lastAt,
 			UnreadCount:     dialogUnreadCount(elem.Dialog),
 			Pinned:          dialogPinned(elem.Dialog),
+			FolderID:        folderID,
+			FolderIDs:       folderIDs,
+			FolderTitle:     folderTitle(folderTitles, folderID),
 			IsOnline:        isUserOnline(user),
 		}
 		peers[chat.ID] = elem.Peer
@@ -498,6 +507,175 @@ func (c *Client) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, e
 	c.mu.Unlock()
 
 	return chats, nil
+}
+
+func (c *Client) ListFolders(ctx context.Context) ([]domains.ChatFolder, error) {
+	if err := c.ensureReady(ctx); err != nil {
+		return nil, err
+	}
+
+	if err := c.refreshSession(c.context()); err != nil {
+		return nil, err
+	}
+
+	c.mu.RLock()
+	authorized := c.session.Authorized
+	c.mu.RUnlock()
+	if !authorized {
+		return nil, errors.New("telegram session is not authorized")
+	}
+
+	raw := tg.NewClient(c.client)
+	folders, _, _ := c.loadDialogFilters(raw)
+	if len(folders) == 0 {
+		return []domains.ChatFolder{{ID: 0, Title: "All"}}, nil
+	}
+
+	return folders, nil
+}
+
+func (c *Client) loadDialogFilters(raw *tg.Client) ([]domains.ChatFolder, map[int]string, map[int]tg.DialogFilterClass) {
+	folders := []domains.ChatFolder{{ID: 0, Title: "All"}}
+	titles := map[int]string{0: "All"}
+	defs := map[int]tg.DialogFilterClass{}
+
+	resp, err := raw.MessagesGetDialogFilters(c.context())
+	if err != nil || resp == nil {
+		return folders, titles, defs
+	}
+
+	for _, filter := range resp.Filters {
+		switch typed := filter.(type) {
+		case *tg.DialogFilter:
+			id := typed.GetID()
+			if id <= 0 {
+				continue
+			}
+			title := strings.TrimSpace(typed.GetTitle().Text)
+			if title == "" {
+				title = fmt.Sprintf("Folder %d", id)
+			}
+			folders = append(folders, domains.ChatFolder{ID: id, Title: title})
+			titles[id] = title
+			defs[id] = typed
+		case *tg.DialogFilterChatlist:
+			id := typed.GetID()
+			if id <= 0 {
+				continue
+			}
+			title := strings.TrimSpace(typed.GetTitle().Text)
+			if title == "" {
+				title = fmt.Sprintf("Folder %d", id)
+			}
+			folders = append(folders, domains.ChatFolder{ID: id, Title: title})
+			titles[id] = title
+			defs[id] = typed
+		}
+	}
+
+	sort.SliceStable(folders, func(i, j int) bool {
+		if folders[i].ID == 0 {
+			return true
+		}
+		if folders[j].ID == 0 {
+			return false
+		}
+		return folders[i].ID < folders[j].ID
+	})
+
+	return folders, titles, defs
+}
+
+func (c *Client) matchCustomFolderIDs(user *tg.User, dialog tg.DialogClass, folders []domains.ChatFolder, defs map[int]tg.DialogFilterClass) []int {
+	chatID := domains.ChatID(user.ID)
+	archived := dialogFolderID(dialog) == 1
+	unread := dialogUnreadCount(dialog) > 0
+	matches := make([]int, 0, 2)
+
+	for _, folder := range folders {
+		if folder.ID <= 0 {
+			continue
+		}
+
+		def, ok := defs[folder.ID]
+		if !ok {
+			continue
+		}
+
+		if dialogMatchesFilter(def, user, chatID, archived, unread) {
+			matches = append(matches, folder.ID)
+		}
+	}
+
+	return matches
+}
+
+func firstFolderID(folderIDs []int) int {
+	if len(folderIDs) == 0 {
+		return 0
+	}
+
+	return folderIDs[0]
+}
+
+func dialogMatchesFilter(def tg.DialogFilterClass, user *tg.User, chatID domains.ChatID, archived bool, unread bool) bool {
+	switch typed := def.(type) {
+	case *tg.DialogFilterChatlist:
+		return peerListContainsUser(typed.PinnedPeers, chatID) || peerListContainsUser(typed.IncludePeers, chatID)
+	case *tg.DialogFilter:
+		explicitInclude := peerListContainsUser(typed.PinnedPeers, chatID) || peerListContainsUser(typed.IncludePeers, chatID)
+		if peerListContainsUser(typed.ExcludePeers, chatID) {
+			return false
+		}
+
+		match := explicitInclude
+		if typed.Contacts && user.Contact {
+			match = true
+		}
+		if typed.NonContacts && !user.Contact {
+			match = true
+		}
+		if typed.Bots && user.Bot {
+			match = true
+		}
+
+		if !match {
+			return false
+		}
+		if typed.ExcludeArchived && archived && !explicitInclude {
+			return false
+		}
+		if typed.ExcludeRead && !unread && !explicitInclude {
+			return false
+		}
+
+		// ExcludeMuted is ignored for now because muted state is not part of
+		// current chat summary mapping.
+		return true
+	}
+
+	return false
+}
+
+func peerListContainsUser(peers []tg.InputPeerClass, chatID domains.ChatID) bool {
+	for _, candidate := range peers {
+		if peerUserID, ok := inputPeerUserID(candidate); ok && domains.ChatID(peerUserID) == chatID {
+			return true
+		}
+	}
+
+	return false
+}
+
+func inputPeerUserID(candidate tg.InputPeerClass) (int64, bool) {
+	switch typed := candidate.(type) {
+	case *tg.InputPeerUser:
+		return typed.UserID, true
+	case *tg.InputPeerUserFromMessage:
+		return typed.UserID, true
+	}
+
+	return 0, false
 }
 
 func (c *Client) ToggleChatPinned(ctx context.Context, chatID domains.ChatID, pinned bool) error {
@@ -1088,4 +1266,26 @@ func dialogPinned(dialog tg.DialogClass) bool {
 	}
 
 	return false
+}
+
+func dialogFolderID(dialog tg.DialogClass) int {
+	if typed, ok := dialog.(*tg.Dialog); ok {
+		if value, hasValue := typed.GetFolderID(); hasValue {
+			return value
+		}
+	}
+
+	return 0
+}
+
+func folderTitle(titles map[int]string, folderID int) string {
+	if title, ok := titles[folderID]; ok {
+		return title
+	}
+
+	if folderID == 0 {
+		return "All"
+	}
+
+	return fmt.Sprintf("Folder %d", folderID)
 }

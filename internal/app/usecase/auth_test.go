@@ -59,6 +59,9 @@ func (f *fakeAuthClient) SubmitPassword(_ context.Context, password string) (app
 func (f *fakeAuthClient) ListPrivateChats(_ context.Context) ([]domains.ChatSummary, error) {
 	return nil, nil
 }
+func (f *fakeAuthClient) ListFolders(_ context.Context) ([]domains.ChatFolder, error) {
+	return []domains.ChatFolder{{ID: 0, Title: "All"}}, nil
+}
 func (f *fakeAuthClient) LoadMessages(_ context.Context, _ domains.ChatID, _ int) ([]domains.Message, error) {
 	return nil, nil
 }

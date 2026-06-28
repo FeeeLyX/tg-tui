@@ -87,6 +87,7 @@ When built with `go build -ldflags`, version metadata is embedded via linker fla
   - message view: set reply target to selected message
 - `Ctrl+U`: clear reply target
 - `Ctrl+P`: toggle pin for selected chat
+- `Ctrl+Left` / `Ctrl+Right`: switch chat folders
 
 ## Security Notes
 

@@ -40,6 +40,7 @@ type TelegramClient interface {
 	ResendCode(ctx context.Context) (AuthState, error)
 	SubmitCode(ctx context.Context, code string) (AuthState, error)
 	SubmitPassword(ctx context.Context, password string) (AuthState, error)
+	ListFolders(ctx context.Context) ([]domains.ChatFolder, error)
 	ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, error)
 	ToggleChatPinned(ctx context.Context, chatID domains.ChatID, pinned bool) error
 	LoadMessages(ctx context.Context, chatID domains.ChatID, limit int) ([]domains.Message, error)

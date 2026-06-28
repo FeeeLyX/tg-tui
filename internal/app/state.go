@@ -7,6 +7,8 @@ type State struct {
 	Session           domains.AccountSession
 	CredentialSummary string
 	CredentialNotice  string
+	Folders           []domains.ChatFolder
+	ActiveFolderID    int
 	Chats             []domains.ChatSummary
 	MessagesByChat    map[domains.ChatID][]domains.Message
 	ActiveChatID      domains.ChatID
@@ -18,6 +20,8 @@ type State struct {
 func NewState() State {
 	return State{
 		AuthState:      AuthState{Step: AuthStepPhone},
+		Folders:        []domains.ChatFolder{{ID: 0, Title: "All"}},
+		ActiveFolderID: 0,
 		MessagesByChat: map[domains.ChatID][]domains.Message{},
 		Status:         "Bootstrapping",
 	}
