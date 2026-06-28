@@ -500,6 +500,42 @@ func (c *Client) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, e
 	return chats, nil
 }
 
+func (c *Client) ToggleChatPinned(ctx context.Context, chatID domains.ChatID, pinned bool) error {
+	if err := c.ensureReady(ctx); err != nil {
+		return err
+	}
+
+	if err := c.refreshSession(c.context()); err != nil {
+		return err
+	}
+
+	c.mu.RLock()
+	authorized := c.session.Authorized
+	c.mu.RUnlock()
+	if !authorized {
+		return errors.New("telegram session is not authorized")
+	}
+
+	peerInput, err := c.resolvePeerInput(ctx, chatID)
+	if err != nil {
+		return err
+	}
+
+	raw := tg.NewClient(c.client)
+	_, err = raw.MessagesToggleDialogPin(c.context(), &tg.MessagesToggleDialogPinRequest{
+		Pinned: pinned,
+		Peer: &tg.InputDialogPeer{
+			Peer: peerInput,
+		},
+	})
+	if err != nil {
+		c.logRPCError("toggling dialog pin", err)
+		return mapAuthError("toggling dialog pin", err)
+	}
+
+	return nil
+}
+
 func (c *Client) LoadMessages(ctx context.Context, chatID domains.ChatID, limit int) ([]domains.Message, error) {
 	if err := c.ensureReady(ctx); err != nil {
 		return nil, err

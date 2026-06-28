@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -51,6 +52,7 @@ type Model struct {
 	messageLimitByChat    map[domains.ChatID]int
 	selectedMessageByChat map[domains.ChatID]int
 	replyToMessageByChat  map[domains.ChatID]int64
+	pinOverrideByChat     map[domains.ChatID]bool
 }
 
 type authResultMsg struct {
@@ -84,6 +86,12 @@ type messageSentMsg struct {
 	err     error
 }
 
+type chatPinToggledMsg struct {
+	chatID domains.ChatID
+	pinned bool
+	err    error
+}
+
 func NewModel(state app.State, client app.TelegramClient) Model {
 	authInput := textinput.New()
 	authInput.Placeholder = "+123456789"
@@ -110,6 +118,7 @@ func NewModel(state app.State, client app.TelegramClient) Model {
 		messageLimitByChat:    map[domains.ChatID]int{},
 		selectedMessageByChat: map[domains.ChatID]int{},
 		replyToMessageByChat:  map[domains.ChatID]int64{},
+		pinOverrideByChat:     map[domains.ChatID]bool{},
 	}
 }
 
@@ -208,11 +217,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !typed.silent {
 			m.state.Error = nil
 		}
+		m.reconcilePinOverrides(typed.chats)
+		chats := m.applyPinOverrides(typed.chats)
 		previousActive := m.state.ActiveChatID
-		m.state.Chats = typed.chats
+		m.state.Chats = chats
 		if previousActive != 0 {
 			stillPresent := false
-			for _, chat := range typed.chats {
+			for _, chat := range chats {
 				if chat.ID == previousActive {
 					stillPresent = true
 					break
@@ -225,18 +236,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		if m.state.ActiveChatID == 0 && len(typed.chats) > 0 {
-			m.state.ActiveChatID = typed.chats[0].ID
+			m.state.ActiveChatID = chats[0].ID
 		}
 
 		if typed.silent {
 			return m, nil
 		}
 
-		if len(typed.chats) == 0 {
+		if len(chats) == 0 {
 			m.state.Status = "Authorized. No private chats found"
 			return m, nil
 		} else {
-			m.state.Status = fmt.Sprintf("Loaded %d private chats", len(typed.chats))
+			m.state.Status = fmt.Sprintf("Loaded %d private chats", len(chats))
 			return m, nil
 		}
 	case messagesLoadedMsg:
@@ -324,6 +335,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.messageScroll = 0
 		m.state.Status = "Message sent"
 		return m, nil
+	case chatPinToggledMsg:
+		if typed.chatID != m.state.ActiveChatID {
+			return m, nil
+		}
+
+		if typed.err != nil {
+			m.state.Error = userFacingError("Toggling chat pin", typed.err)
+			if isTimeoutError(typed.err) {
+				m.state.Status = "Chat pin update timed out"
+			} else {
+				m.state.Status = "Failed to update chat pin"
+			}
+			return m, nil
+		}
+
+		m.state.Error = nil
+		m.pinOverrideByChat[typed.chatID] = typed.pinned
+		m.applyLocalChatPinState(typed.chatID, typed.pinned)
+		if typed.pinned {
+			m.state.Status = "Chat pinned"
+		} else {
+			m.state.Status = "Chat unpinned"
+		}
+		return m, m.loadPrivateChatsSilent()
 	case tea.KeyMsg:
 		if isMouseEscapeKey(typed) {
 			return m, nil
@@ -501,6 +536,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.state.Status = "Reached newest message"
 				}
 				return m, nil
+			}
+		case "ctrl+p":
+			if m.state.Session.Authorized {
+				chat, ok := m.activeChatSummary()
+				if !ok {
+					m.state.Status = "Select a chat first"
+					return m, nil
+				}
+
+				m.state.Status = "Updating chat pin"
+				m.state.Error = nil
+				return m, m.toggleActiveChatPin(chat.ID, !chat.Pinned)
 			}
 		}
 	}
@@ -886,6 +933,17 @@ func (m Model) sendMessage(chatID domains.ChatID, text string, replyToMessageID 
 	}
 }
 
+func (m Model) toggleActiveChatPin(chatID domains.ChatID, pinned bool) tea.Cmd {
+	chatUC := m.chatUC
+
+	return func() tea.Msg {
+		ctx, cancel := m.commandContext()
+		defer cancel()
+		err := chatUC.TogglePinned(ctx, chatID, pinned)
+		return chatPinToggledMsg{chatID: chatID, pinned: pinned, err: err}
+	}
+}
+
 func (m Model) commandContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), commandTimeout)
 }
@@ -921,6 +979,59 @@ func (m *Model) selectRelativeChat(delta int) bool {
 	}
 	m.state.ActiveChatID = nextID
 	return true
+}
+
+func (m *Model) activeChatSummary() (domains.ChatSummary, bool) {
+	for _, chat := range m.state.Chats {
+		if chat.ID == m.state.ActiveChatID {
+			return chat, true
+		}
+	}
+
+	return domains.ChatSummary{}, false
+}
+
+func (m *Model) applyLocalChatPinState(chatID domains.ChatID, pinned bool) {
+	for i := range m.state.Chats {
+		if m.state.Chats[i].ID == chatID {
+			m.state.Chats[i].Pinned = pinned
+			break
+		}
+	}
+
+	sortChatsByPinnedAndRecency(m.state.Chats)
+}
+
+func (m *Model) reconcilePinOverrides(chats []domains.ChatSummary) {
+	for _, chat := range chats {
+		desired, ok := m.pinOverrideByChat[chat.ID]
+		if !ok {
+			continue
+		}
+		if chat.Pinned == desired {
+			delete(m.pinOverrideByChat, chat.ID)
+		}
+	}
+}
+
+func (m *Model) applyPinOverrides(chats []domains.ChatSummary) []domains.ChatSummary {
+	for i := range chats {
+		if desired, ok := m.pinOverrideByChat[chats[i].ID]; ok {
+			chats[i].Pinned = desired
+		}
+	}
+
+	sortChatsByPinnedAndRecency(chats)
+	return chats
+}
+
+func sortChatsByPinnedAndRecency(chats []domains.ChatSummary) {
+	sort.SliceStable(chats, func(i, j int) bool {
+		if chats[i].Pinned != chats[j].Pinned {
+			return chats[i].Pinned
+		}
+		return chats[i].LastMessageAt.After(chats[j].LastMessageAt)
+	})
 }
 
 func oneLine(value string) string {

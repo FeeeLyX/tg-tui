@@ -65,6 +65,9 @@ func (f *fakeAuthClient) LoadMessages(_ context.Context, _ domains.ChatID, _ int
 func (f *fakeAuthClient) SendMessage(_ context.Context, _ domains.ChatID, _ string, _ int64) (domains.Message, error) {
 	return domains.Message{}, nil
 }
+func (f *fakeAuthClient) ToggleChatPinned(_ context.Context, _ domains.ChatID, _ bool) error {
+	return nil
+}
 func (f *fakeAuthClient) Updates() <-chan domains.AppEvent { return nil }
 func (f *fakeAuthClient) Close() error                     { return nil }
 

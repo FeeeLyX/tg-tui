@@ -61,6 +61,17 @@ func (u Chat) SendMessage(ctx context.Context, chatID domains.ChatID, text strin
 	return u.client.SendMessage(ctx, chatID, body, replyToMessageID)
 }
 
+func (u Chat) TogglePinned(ctx context.Context, chatID domains.ChatID, pinned bool) error {
+	if u.client == nil {
+		return errors.New("telegram client is not initialized")
+	}
+	if chatID == 0 {
+		return errors.New("chat is not selected")
+	}
+
+	return u.client.ToggleChatPinned(ctx, chatID, pinned)
+}
+
 func normalizeMessageLimit(limit int) int {
 	if limit <= 0 {
 		return DefaultMessageLimit

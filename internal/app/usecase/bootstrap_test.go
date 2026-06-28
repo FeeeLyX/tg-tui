@@ -70,6 +70,9 @@ func (f *fakeTelegramClient) LoadMessages(_ context.Context, _ domains.ChatID, _
 func (f *fakeTelegramClient) SendMessage(_ context.Context, _ domains.ChatID, _ string, _ int64) (domains.Message, error) {
 	return domains.Message{}, nil
 }
+func (f *fakeTelegramClient) ToggleChatPinned(_ context.Context, _ domains.ChatID, _ bool) error {
+	return nil
+}
 func (f *fakeTelegramClient) Updates() <-chan domains.AppEvent { return nil }
 func (f *fakeTelegramClient) Close() error {
 	f.closed = true
