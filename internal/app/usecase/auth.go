@@ -65,7 +65,13 @@ func (u Auth) SubmitInput(ctx context.Context, step app.AuthStep, value string) 
 		return app.AuthState{}, domains.AccountSession{}, errors.New("telegram client is not initialized")
 	}
 
-	trimmed := strings.TrimSpace(value)
+	// For password, do not trim: leading/trailing spaces are valid in Telegram 2FA.
+	var trimmed string
+	if step == app.AuthStepPassword {
+		trimmed = value
+	} else {
+		trimmed = strings.TrimSpace(value)
+	}
 	if step != app.AuthStepQR && trimmed == "" {
 		return app.AuthState{}, domains.AccountSession{}, errors.New("auth input cannot be empty")
 	}
@@ -92,4 +98,22 @@ func (u Auth) SubmitInput(ctx context.Context, step app.AuthStep, value string) 
 
 	session, err := u.client.Session(ctx)
 	return nextState, session, err
+}
+
+func (u Auth) Logout(ctx context.Context) (app.AuthState, domains.AccountSession, error) {
+	if u.client == nil {
+		return app.AuthState{}, domains.AccountSession{}, errors.New("telegram client is not initialized")
+	}
+
+	if err := u.client.Logout(ctx); err != nil {
+		return app.AuthState{}, domains.AccountSession{}, err
+	}
+
+	state, err := u.client.AuthState(ctx)
+	if err != nil {
+		return app.AuthState{}, domains.AccountSession{}, err
+	}
+
+	session, err := u.client.Session(ctx)
+	return state, session, err
 }

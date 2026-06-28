@@ -61,6 +61,7 @@ func (f *fakeTelegramClient) SubmitCode(_ context.Context, _ string) (app.AuthSt
 func (f *fakeTelegramClient) SubmitPassword(_ context.Context, _ string) (app.AuthState, error) {
 	return app.AuthState{}, nil
 }
+func (f *fakeTelegramClient) Logout(_ context.Context) error { return nil }
 func (f *fakeTelegramClient) ListPrivateChats(_ context.Context) ([]domains.ChatSummary, error) {
 	return nil, nil
 }
