@@ -30,6 +30,13 @@ func (u Chat) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, erro
 	return u.client.ListPrivateChats(ctx)
 }
 
+func (u Chat) ListFolders(ctx context.Context) ([]domains.ChatFolder, error) {
+	if u.client == nil {
+		return nil, errors.New("telegram client is not initialized")
+	}
+	return u.client.ListFolders(ctx)
+}
+
 func (u Chat) LoadMessages(ctx context.Context, chatID domains.ChatID, limit int) ([]domains.Message, int, error) {
 	if u.client == nil {
 		return nil, 0, errors.New("telegram client is not initialized")
@@ -59,6 +66,17 @@ func (u Chat) SendMessage(ctx context.Context, chatID domains.ChatID, text strin
 		return domains.Message{}, errors.New("message text cannot be empty")
 	}
 	return u.client.SendMessage(ctx, chatID, body, replyToMessageID)
+}
+
+func (u Chat) TogglePinned(ctx context.Context, chatID domains.ChatID, pinned bool) error {
+	if u.client == nil {
+		return errors.New("telegram client is not initialized")
+	}
+	if chatID == 0 {
+		return errors.New("chat is not selected")
+	}
+
+	return u.client.ToggleChatPinned(ctx, chatID, pinned)
 }
 
 func normalizeMessageLimit(limit int) int {

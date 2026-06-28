@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.2.0] - 2026-06-28
+
+### Added
+
+- Group and supergroup chat support — groups and supergroups are now listed alongside private chats.
+- Channel support — broadcast channels appear in the chat list.
+- Bot chat support — bot conversations are listed and accessible.
+- Chat type tags: `[G]` for groups, `[C]` for channels, `[B]` for bots.
+- Pinned tag `[PIN]` combined with type tags: e.g. `[PIN] [G]`.
+- Per-type color gradient for tags that fade to gray with list position.
+- Chat list gradient uses terminal palette colors (adapts to system/terminal theme changes).
+- Smooth interpolation between palette anchor stops for gradients.
+- Folder filter matching extended to groups and channels (Telegram folder flags: Groups, Broadcasts).
+- Duplicate dialog deduplication in both adapter and UI layers.
+- Layout stability fix: deep-scroll overlap/shift no longer occurs due to problematic Unicode characters.
+
+### Changed
+
+- Chat list no longer restricted to private chats — all dialog types are shown.
+- Stable collision-free chat IDs across peer types (users, groups, channels).
+- `oneLine` text normalization now strips combining marks and non-single-width glyphs to prevent layout shift.
+- Panel row rendering uses a strict single-line fitter (`fitPanelLine`) to prevent content overflow.
+
 ## [0.1.0] - 2026-06-28
 
 ### Added

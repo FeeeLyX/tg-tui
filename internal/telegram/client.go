@@ -1,11 +1,17 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
 	crand "crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"os"
 	"sort"
 	"strings"
@@ -16,6 +22,7 @@ import (
 	gotd "github.com/gotd/td/telegram"
 	tgauth "github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/telegram/auth/qrlogin"
+	"github.com/gotd/td/telegram/downloader"
 	"github.com/gotd/td/telegram/message/peer"
 	"github.com/gotd/td/telegram/query"
 	"github.com/gotd/td/tg"
@@ -49,20 +56,27 @@ type Client struct {
 	phone            string
 	codeHash         string
 	peerByChatID     map[domains.ChatID]tg.InputPeerClass
+	imageASCIIByKey  map[string]imageASCIICache
 	closed           bool
 	started          bool
 	verbose          bool
 	closeUpdatesOnce sync.Once
 }
 
+type imageASCIICache struct {
+	preview string
+	full    string
+}
+
 func NewClient(config app.Config) *Client {
 	service := &Client{
-		updates:      make(chan domains.AppEvent, 32),
-		readyCh:      make(chan struct{}),
-		stopCh:       make(chan struct{}),
-		doneCh:       make(chan error, 1),
-		verbose:      config.Verbose,
-		peerByChatID: make(map[domains.ChatID]tg.InputPeerClass),
+		updates:         make(chan domains.AppEvent, 32),
+		readyCh:         make(chan struct{}),
+		stopCh:          make(chan struct{}),
+		doneCh:          make(chan error, 1),
+		verbose:         config.Verbose,
+		peerByChatID:    make(map[domains.ChatID]tg.InputPeerClass),
+		imageASCIIByKey: make(map[string]imageASCIICache),
 		authState: app.AuthState{
 			Step: app.AuthStepPhone,
 			Hint: "Enter your Telegram phone number to begin login.",
@@ -161,7 +175,9 @@ func (c *Client) SubmitPhone(ctx context.Context, phone string) (app.AuthState, 
 	}
 	c.logf("auth SendCode request: phone=%s", maskPhone(phone))
 
-	sentCode, err := c.authClient().SendCode(c.context(), phone, tgauth.SendCodeOptions{})
+	sentCode, err := c.authClient().SendCode(c.context(), phone, tgauth.SendCodeOptions{
+		AllowAppHash: true,
+	})
 	if err != nil {
 		c.logRPCError("requesting login code", err)
 		return app.AuthState{}, mapAuthError("requesting login code", err)
@@ -430,6 +446,32 @@ func (c *Client) SubmitPassword(ctx context.Context, password string) (app.AuthS
 	return c.authState, nil
 }
 
+func (c *Client) Logout(ctx context.Context) error {
+	if err := c.ensureReady(ctx); err != nil {
+		return err
+	}
+
+	raw := tg.NewClient(c.client)
+	if _, err := raw.AuthLogOut(c.context()); err != nil {
+		c.logRPCError("logging out", err)
+		return mapAuthError("logging out", err)
+	}
+
+	c.mu.Lock()
+	c.phone = ""
+	c.codeHash = ""
+	c.session = domains.AccountSession{Authorized: false, UpdatedAt: time.Now()}
+	c.authState = app.AuthState{
+		Step: app.AuthStepPhone,
+		Hint: "Enter your Telegram phone number to begin login.",
+	}
+	c.peerByChatID = make(map[domains.ChatID]tg.InputPeerClass)
+	c.imageASCIIByKey = make(map[string]imageASCIICache)
+	c.mu.Unlock()
+
+	return nil
+}
+
 func (c *Client) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, error) {
 	if err := c.ensureReady(ctx); err != nil {
 		return nil, err
@@ -447,6 +489,10 @@ func (c *Client) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, e
 	}
 
 	raw := tg.NewClient(c.client)
+	folders, folderTitles, filterDefs := c.loadDialogFilters(raw)
+	if len(folders) == 0 {
+		folders = []domains.ChatFolder{{ID: 0, Title: "All"}}
+	}
 	iter := query.GetDialogs(raw).BatchSize(100).Iter()
 
 	chats := make([]domains.ChatSummary, 0, 64)
@@ -457,25 +503,27 @@ func (c *Client) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, e
 			continue
 		}
 
-		peerUser, ok := elem.Dialog.GetPeer().(*tg.PeerUser)
-		if !ok {
-			// MVP scope: private chats only.
-			continue
-		}
-
-		user, ok := elem.Entities.User(peerUser.UserID)
+		meta, ok := c.dialogMetaFromPeer(elem.Peer, elem.Entities)
 		if !ok {
 			continue
 		}
 
 		lastText, lastAt := extractLastMessage(elem.Last)
+		folderIDs := c.matchCustomFolderIDs(meta, elem.Dialog, folders, filterDefs)
+		folderID := firstFolderID(folderIDs)
 		chat := domains.ChatSummary{
-			ID:              domains.ChatID(user.ID),
-			Title:           privateChatTitle(user),
+			ID:              meta.ChatID,
+			Type:            meta.ChatType,
+			Title:           meta.Title,
 			LastMessageText: lastText,
 			LastMessageAt:   lastAt,
 			UnreadCount:     dialogUnreadCount(elem.Dialog),
-			IsOnline:        isUserOnline(user),
+			Pinned:          dialogPinned(elem.Dialog),
+			FolderID:        folderID,
+			FolderIDs:       folderIDs,
+			FolderTitle:     folderTitle(folderTitles, folderID),
+			IsOnline:        meta.IsOnline,
+			IsBot:           meta.IsBot,
 		}
 		peers[chat.ID] = elem.Peer
 		chats = append(chats, chat)
@@ -485,7 +533,12 @@ func (c *Client) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, e
 		return nil, fmt.Errorf("list dialogs: %w", err)
 	}
 
+	chats = dedupeChatsByID(chats)
+
 	sort.SliceStable(chats, func(i, j int) bool {
+		if chats[i].Pinned != chats[j].Pinned {
+			return chats[i].Pinned
+		}
 		return chats[i].LastMessageAt.After(chats[j].LastMessageAt)
 	})
 
@@ -494,6 +547,222 @@ func (c *Client) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, e
 	c.mu.Unlock()
 
 	return chats, nil
+}
+
+func (c *Client) ListFolders(ctx context.Context) ([]domains.ChatFolder, error) {
+	if err := c.ensureReady(ctx); err != nil {
+		return nil, err
+	}
+
+	if err := c.refreshSession(c.context()); err != nil {
+		return nil, err
+	}
+
+	c.mu.RLock()
+	authorized := c.session.Authorized
+	c.mu.RUnlock()
+	if !authorized {
+		return nil, errors.New("telegram session is not authorized")
+	}
+
+	raw := tg.NewClient(c.client)
+	folders, _, _ := c.loadDialogFilters(raw)
+	if len(folders) == 0 {
+		return []domains.ChatFolder{{ID: 0, Title: "All"}}, nil
+	}
+
+	return folders, nil
+}
+
+func (c *Client) loadDialogFilters(raw *tg.Client) ([]domains.ChatFolder, map[int]string, map[int]tg.DialogFilterClass) {
+	folders := []domains.ChatFolder{{ID: 0, Title: "All"}}
+	titles := map[int]string{0: "All"}
+	defs := map[int]tg.DialogFilterClass{}
+
+	resp, err := raw.MessagesGetDialogFilters(c.context())
+	if err != nil || resp == nil {
+		return folders, titles, defs
+	}
+
+	for _, filter := range resp.Filters {
+		switch typed := filter.(type) {
+		case *tg.DialogFilter:
+			id := typed.GetID()
+			if id <= 0 {
+				continue
+			}
+			title := strings.TrimSpace(typed.GetTitle().Text)
+			if title == "" {
+				title = fmt.Sprintf("Folder %d", id)
+			}
+			folders = append(folders, domains.ChatFolder{ID: id, Title: title})
+			titles[id] = title
+			defs[id] = typed
+		case *tg.DialogFilterChatlist:
+			id := typed.GetID()
+			if id <= 0 {
+				continue
+			}
+			title := strings.TrimSpace(typed.GetTitle().Text)
+			if title == "" {
+				title = fmt.Sprintf("Folder %d", id)
+			}
+			folders = append(folders, domains.ChatFolder{ID: id, Title: title})
+			titles[id] = title
+			defs[id] = typed
+		}
+	}
+
+	sort.SliceStable(folders, func(i, j int) bool {
+		if folders[i].ID == 0 {
+			return true
+		}
+		if folders[j].ID == 0 {
+			return false
+		}
+		return folders[i].ID < folders[j].ID
+	})
+
+	return folders, titles, defs
+}
+
+func (c *Client) matchCustomFolderIDs(meta dialogMeta, dialog tg.DialogClass, folders []domains.ChatFolder, defs map[int]tg.DialogFilterClass) []int {
+	archived := dialogFolderID(dialog) == 1
+	unread := dialogUnreadCount(dialog) > 0
+	matches := make([]int, 0, 2)
+
+	for _, folder := range folders {
+		if folder.ID <= 0 {
+			continue
+		}
+
+		def, ok := defs[folder.ID]
+		if !ok {
+			continue
+		}
+
+		if dialogMatchesFilter(def, meta, archived, unread) {
+			matches = append(matches, folder.ID)
+		}
+	}
+
+	return matches
+}
+
+func firstFolderID(folderIDs []int) int {
+	if len(folderIDs) == 0 {
+		return 0
+	}
+
+	return folderIDs[0]
+}
+
+func dialogMatchesFilter(def tg.DialogFilterClass, meta dialogMeta, archived bool, unread bool) bool {
+	switch typed := def.(type) {
+	case *tg.DialogFilterChatlist:
+		return peerListContains(typed.PinnedPeers, meta.Peer) || peerListContains(typed.IncludePeers, meta.Peer)
+	case *tg.DialogFilter:
+		explicitInclude := peerListContains(typed.PinnedPeers, meta.Peer) || peerListContains(typed.IncludePeers, meta.Peer)
+		if peerListContains(typed.ExcludePeers, meta.Peer) {
+			return false
+		}
+
+		match := explicitInclude
+		if typed.Contacts && meta.IsContact {
+			match = true
+		}
+		if typed.NonContacts && meta.IsNonContact {
+			match = true
+		}
+		if typed.Bots && meta.IsBot {
+			match = true
+		}
+		if typed.Groups && meta.IsGroup {
+			match = true
+		}
+		if typed.Broadcasts && meta.IsBroadcast {
+			match = true
+		}
+
+		if !match {
+			return false
+		}
+		if typed.ExcludeArchived && archived && !explicitInclude {
+			return false
+		}
+		if typed.ExcludeRead && !unread && !explicitInclude {
+			return false
+		}
+
+		// ExcludeMuted is ignored for now because muted state is not part of
+		// current chat summary mapping.
+		return true
+	}
+
+	return false
+}
+
+func peerListContains(peers []tg.InputPeerClass, target dialogPeerKey) bool {
+	for _, candidate := range peers {
+		if key, ok := peerKeyFromInputPeer(candidate); ok && key == target {
+			return true
+		}
+	}
+
+	return false
+}
+
+func peerKeyFromInputPeer(candidate tg.InputPeerClass) (dialogPeerKey, bool) {
+	switch typed := candidate.(type) {
+	case *tg.InputPeerUser:
+		return dialogPeerKey{Kind: "user", ID: typed.UserID}, true
+	case *tg.InputPeerUserFromMessage:
+		return dialogPeerKey{Kind: "user", ID: typed.UserID}, true
+	case *tg.InputPeerChat:
+		return dialogPeerKey{Kind: "chat", ID: int64(typed.ChatID)}, true
+	case *tg.InputPeerChannel:
+		return dialogPeerKey{Kind: "channel", ID: typed.ChannelID}, true
+	case *tg.InputPeerChannelFromMessage:
+		return dialogPeerKey{Kind: "channel", ID: typed.ChannelID}, true
+	}
+
+	return dialogPeerKey{}, false
+}
+
+func (c *Client) ToggleChatPinned(ctx context.Context, chatID domains.ChatID, pinned bool) error {
+	if err := c.ensureReady(ctx); err != nil {
+		return err
+	}
+
+	if err := c.refreshSession(c.context()); err != nil {
+		return err
+	}
+
+	c.mu.RLock()
+	authorized := c.session.Authorized
+	c.mu.RUnlock()
+	if !authorized {
+		return errors.New("telegram session is not authorized")
+	}
+
+	peerInput, err := c.resolvePeerInput(ctx, chatID)
+	if err != nil {
+		return err
+	}
+
+	raw := tg.NewClient(c.client)
+	_, err = raw.MessagesToggleDialogPin(c.context(), &tg.MessagesToggleDialogPinRequest{
+		Pinned: pinned,
+		Peer: &tg.InputDialogPeer{
+			Peer: peerInput,
+		},
+	})
+	if err != nil {
+		c.logRPCError("toggling dialog pin", err)
+		return mapAuthError("toggling dialog pin", err)
+	}
+
+	return nil
 }
 
 func (c *Client) LoadMessages(ctx context.Context, chatID domains.ChatID, limit int) ([]domains.Message, error) {
@@ -530,7 +799,11 @@ func (c *Client) LoadMessages(ctx context.Context, chatID domains.ChatID, limit 
 	messages := make([]domains.Message, 0, limit)
 	for iter.Next(c.context()) {
 		elem := iter.Value()
-		messages = append(messages, mapMessage(elem.Msg, chatID, elem.Entities))
+		mapped := mapMessage(elem.Msg, chatID, elem.Entities)
+		if photo, ok := elem.Photo(); ok {
+			c.enrichMessageWithPhotoASCII(c.context(), raw, chatID, mapped.ID, photo, &mapped)
+		}
+		messages = append(messages, mapped)
 		if len(messages) >= limit {
 			break
 		}
@@ -875,6 +1148,145 @@ func mapAuthError(action string, err error) error {
 	return err
 }
 
+type dialogPeerKey struct {
+	Kind string
+	ID   int64
+}
+
+type dialogMeta struct {
+	ChatID       domains.ChatID
+	ChatType     domains.ChatType
+	Peer         dialogPeerKey
+	Title        string
+	IsOnline     bool
+	IsContact    bool
+	IsNonContact bool
+	IsBot        bool
+	IsGroup      bool
+	IsBroadcast  bool
+}
+
+func (c *Client) dialogMetaFromPeer(inputPeer tg.InputPeerClass, entities peer.Entities) (dialogMeta, bool) {
+	key, ok := peerKeyFromInputPeer(inputPeer)
+	if !ok {
+		return dialogMeta{}, false
+	}
+
+	meta := dialogMeta{ChatID: chatIDFromPeerKey(key), Peer: key}
+
+	switch key.Kind {
+	case "user":
+		user, exists := entities.User(key.ID)
+		if !exists {
+			return dialogMeta{}, false
+		}
+		meta.ChatType = domains.ChatTypePrivate
+		meta.Title = privateChatTitle(user)
+		meta.IsOnline = isUserOnline(user)
+		meta.IsContact = user.Contact
+		meta.IsNonContact = !user.Contact
+		meta.IsBot = user.Bot
+		return meta, true
+	case "chat":
+		chat, exists := entities.Chat(key.ID)
+		if !exists {
+			return dialogMeta{}, false
+		}
+		meta.ChatType = domains.ChatTypeGroup
+		title := strings.TrimSpace(chat.Title)
+		if title == "" {
+			title = fmt.Sprintf("Group %d", key.ID)
+		}
+		meta.Title = title
+		meta.IsGroup = true
+		return meta, true
+	case "channel":
+		channel, exists := entities.Channel(key.ID)
+		if !exists {
+			return dialogMeta{}, false
+		}
+		title := strings.TrimSpace(channel.Title)
+		if title == "" {
+			title = fmt.Sprintf("Channel %d", key.ID)
+		}
+		meta.Title = title
+		meta.IsBroadcast = channel.Broadcast && !channel.Megagroup
+		meta.IsGroup = !meta.IsBroadcast
+		if meta.IsBroadcast {
+			meta.ChatType = domains.ChatTypeChannel
+		} else {
+			meta.ChatType = domains.ChatTypeGroup
+		}
+		return meta, true
+	default:
+		return dialogMeta{}, false
+	}
+}
+
+func chatIDFromPeerKey(key dialogPeerKey) domains.ChatID {
+	switch key.Kind {
+	case "chat":
+		return domains.ChatID(-key.ID)
+	case "channel":
+		return domains.ChatID(-1000000000000 - key.ID)
+	default:
+		return domains.ChatID(key.ID)
+	}
+}
+
+func dedupeChatsByID(chats []domains.ChatSummary) []domains.ChatSummary {
+	if len(chats) <= 1 {
+		return chats
+	}
+
+	bestByID := make(map[domains.ChatID]domains.ChatSummary, len(chats))
+	for _, chat := range chats {
+		existing, ok := bestByID[chat.ID]
+		if !ok {
+			bestByID[chat.ID] = chat
+			continue
+		}
+
+		merged := existing
+		if chat.Pinned && !existing.Pinned {
+			merged.Pinned = true
+		}
+		if chat.UnreadCount > merged.UnreadCount {
+			merged.UnreadCount = chat.UnreadCount
+		}
+		if chat.LastMessageAt.After(merged.LastMessageAt) {
+			merged.LastMessageAt = chat.LastMessageAt
+			merged.LastMessageText = chat.LastMessageText
+		}
+		if strings.TrimSpace(merged.Title) == "" && strings.TrimSpace(chat.Title) != "" {
+			merged.Title = chat.Title
+		}
+		if merged.Type == "" && chat.Type != "" {
+			merged.Type = chat.Type
+		}
+		if len(chat.FolderIDs) > len(merged.FolderIDs) {
+			merged.FolderIDs = chat.FolderIDs
+			merged.FolderID = chat.FolderID
+			merged.FolderTitle = chat.FolderTitle
+		}
+		if chat.IsOnline {
+			merged.IsOnline = true
+		}
+		if chat.IsBot {
+			merged.IsBot = true
+		}
+
+		bestByID[chat.ID] = merged
+	}
+
+	unique := make([]domains.ChatSummary, 0, len(bestByID))
+	for _, chat := range bestByID {
+		unique = append(unique, chat)
+	}
+
+	return unique
+}
+
 func privateChatTitle(user *tg.User) string {
 	if user == nil {
 		return "Unknown"
@@ -990,6 +1402,134 @@ func mapMessage(msg tg.NotEmptyMessage, chatID domains.ChatID, entities peer.Ent
 	return result
 }
 
+func (c *Client) enrichMessageWithPhotoASCII(ctx context.Context, raw *tg.Client, chatID domains.ChatID, messageID int64, photo *tg.Photo, result *domains.Message) {
+	if result == nil || photo == nil || messageID == 0 {
+		return
+	}
+
+	cacheKey := imageCacheKey(chatID, messageID)
+	c.mu.RLock()
+	cached, ok := c.imageASCIIByKey[cacheKey]
+	c.mu.RUnlock()
+	if ok {
+		result.HasImage = true
+		result.ImagePreviewASCII = cached.preview
+		result.ImageFullASCII = cached.full
+		return
+	}
+
+	fileLocation, ok := largestPhotoLocation(photo)
+	if !ok {
+		result.HasImage = true
+		result.ImagePreviewASCII = "[image]"
+		result.ImageFullASCII = "[image unavailable]"
+		return
+	}
+
+	var payload bytes.Buffer
+	_, err := downloader.NewDownloader().Download(raw, fileLocation).WithThreads(2).Stream(ctx, &payload)
+	if err != nil {
+		result.HasImage = true
+		result.ImagePreviewASCII = "[image]"
+		result.ImageFullASCII = "[image download failed]"
+		return
+	}
+
+	src, _, err := image.Decode(bytes.NewReader(payload.Bytes()))
+	if err != nil {
+		result.HasImage = true
+		result.ImagePreviewASCII = "[image]"
+		result.ImageFullASCII = "[image decode failed]"
+		return
+	}
+
+	preview := imageToANSIBlocks(src, 30, 10)
+	full := imageToANSIBlocks(src, 100, 34)
+
+	result.HasImage = true
+	result.ImagePreviewASCII = preview
+	result.ImageFullASCII = full
+
+	c.mu.Lock()
+	c.imageASCIIByKey[cacheKey] = imageASCIICache{preview: preview, full: full}
+	c.mu.Unlock()
+}
+
+func imageCacheKey(chatID domains.ChatID, messageID int64) string {
+	return fmt.Sprintf("%d:%d", chatID, messageID)
+}
+
+type sizedPhoto interface {
+	GetW() int
+	GetH() int
+	GetType() string
+}
+
+func largestPhotoLocation(photo *tg.Photo) (tg.InputFileLocationClass, bool) {
+	if photo == nil {
+		return nil, false
+	}
+
+	typeName := ""
+	bestArea := 0
+	for _, variant := range photo.Sizes {
+		sized, ok := variant.(sizedPhoto)
+		if !ok {
+			continue
+		}
+		area := sized.GetW() * sized.GetH()
+		if area > bestArea {
+			bestArea = area
+			typeName = sized.GetType()
+		}
+	}
+
+	if typeName == "" {
+		return nil, false
+	}
+
+	return photo.AsInputPhotoFileLocation(typeName), true
+}
+
+func imageToANSIBlocks(img image.Image, columns int, maxRows int) string {
+	if img == nil || columns <= 0 || maxRows <= 0 {
+		return "[image]"
+	}
+
+	bounds := img.Bounds()
+	width := bounds.Dx()
+	height := bounds.Dy()
+	if width <= 0 || height <= 0 {
+		return "[image]"
+	}
+
+	rows := int((float64(columns) * float64(height) / float64(width)) * 0.5)
+	if rows < 3 {
+		rows = 3
+	}
+	if rows > maxRows {
+		rows = maxRows
+	}
+
+	lines := make([]string, 0, rows)
+	for y := 0; y < rows; y++ {
+		topY := bounds.Min.Y + ((2*y)*height)/(rows*2)
+		bottomY := bounds.Min.Y + ((2*y+1)*height)/(rows*2)
+		var row strings.Builder
+		row.Grow(columns * 24)
+		for x := 0; x < columns; x++ {
+			sx := bounds.Min.X + (x*width)/columns
+			top := color.RGBAModel.Convert(img.At(sx, topY)).(color.RGBA)
+			bottom := color.RGBAModel.Convert(img.At(sx, bottomY)).(color.RGBA)
+			row.WriteString(fmt.Sprintf("\x1b[38;2;%d;%d;%dm\x1b[48;2;%d;%d;%dm▀", top.R, top.G, top.B, bottom.R, bottom.G, bottom.B))
+		}
+		row.WriteString("\x1b[0m")
+		lines = append(lines, row.String())
+	}
+
+	return strings.Join(lines, "\n")
+}
+
 func extractReplyToMessageID(message *tg.Message) int64 {
 	if message == nil || message.ReplyTo == nil {
 		return 0
@@ -1040,4 +1580,34 @@ func dialogUnreadCount(dialog tg.DialogClass) int {
 	}
 
 	return 0
+}
+
+func dialogPinned(dialog tg.DialogClass) bool {
+	if typed, ok := dialog.(*tg.Dialog); ok {
+		return typed.Pinned
+	}
+
+	return false
+}
+
+func dialogFolderID(dialog tg.DialogClass) int {
+	if typed, ok := dialog.(*tg.Dialog); ok {
+		if value, hasValue := typed.GetFolderID(); hasValue {
+			return value
+		}
+	}
+
+	return 0
+}
+
+func folderTitle(titles map[int]string, folderID int) string {
+	if title, ok := titles[folderID]; ok {
+		return title
+	}
+
+	if folderID == 0 {
+		return "All"
+	}
+
+	return fmt.Sprintf("Folder %d", folderID)
 }

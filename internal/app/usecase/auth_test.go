@@ -56,14 +56,21 @@ func (f *fakeAuthClient) SubmitPassword(_ context.Context, password string) (app
 	f.submitPasswordInput = password
 	return f.nextState, f.submitErr
 }
+func (f *fakeAuthClient) Logout(_ context.Context) error { return nil }
 func (f *fakeAuthClient) ListPrivateChats(_ context.Context) ([]domains.ChatSummary, error) {
 	return nil, nil
+}
+func (f *fakeAuthClient) ListFolders(_ context.Context) ([]domains.ChatFolder, error) {
+	return []domains.ChatFolder{{ID: 0, Title: "All"}}, nil
 }
 func (f *fakeAuthClient) LoadMessages(_ context.Context, _ domains.ChatID, _ int) ([]domains.Message, error) {
 	return nil, nil
 }
 func (f *fakeAuthClient) SendMessage(_ context.Context, _ domains.ChatID, _ string, _ int64) (domains.Message, error) {
 	return domains.Message{}, nil
+}
+func (f *fakeAuthClient) ToggleChatPinned(_ context.Context, _ domains.ChatID, _ bool) error {
+	return nil
 }
 func (f *fakeAuthClient) Updates() <-chan domains.AppEvent { return nil }
 func (f *fakeAuthClient) Close() error                     { return nil }

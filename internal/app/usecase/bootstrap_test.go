@@ -61,14 +61,21 @@ func (f *fakeTelegramClient) SubmitCode(_ context.Context, _ string) (app.AuthSt
 func (f *fakeTelegramClient) SubmitPassword(_ context.Context, _ string) (app.AuthState, error) {
 	return app.AuthState{}, nil
 }
+func (f *fakeTelegramClient) Logout(_ context.Context) error { return nil }
 func (f *fakeTelegramClient) ListPrivateChats(_ context.Context) ([]domains.ChatSummary, error) {
 	return nil, nil
+}
+func (f *fakeTelegramClient) ListFolders(_ context.Context) ([]domains.ChatFolder, error) {
+	return []domains.ChatFolder{{ID: 0, Title: "All"}}, nil
 }
 func (f *fakeTelegramClient) LoadMessages(_ context.Context, _ domains.ChatID, _ int) ([]domains.Message, error) {
 	return nil, nil
 }
 func (f *fakeTelegramClient) SendMessage(_ context.Context, _ domains.ChatID, _ string, _ int64) (domains.Message, error) {
 	return domains.Message{}, nil
+}
+func (f *fakeTelegramClient) ToggleChatPinned(_ context.Context, _ domains.ChatID, _ bool) error {
+	return nil
 }
 func (f *fakeTelegramClient) Updates() <-chan domains.AppEvent { return nil }
 func (f *fakeTelegramClient) Close() error {

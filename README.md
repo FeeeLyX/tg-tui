@@ -2,6 +2,15 @@
 
 Terminal Telegram client focused on fast private-chat workflows.
 
+## v0.2.0 Highlights
+
+- **Groups, supergroups, channels, and bot chats** now fully listed alongside private chats.
+- Chat type tags: `[G]` groups · `[C]` channels · `[B]` bots · `[PIN]` pinned (combinable).
+- Per-type color gradients that adapt to your system/terminal color palette.
+- Smooth gradient interpolation between palette anchor stops.
+- Folder filter support extended to groups and channels.
+- Chat list deduplication and deep-scroll layout stability fixes.
+
 ## v0.1.0 Highlights
 
 - MTProto auth with phone/code and optional 2FA password.
@@ -51,7 +60,7 @@ go test ./...
 To build a local binary with embedded version metadata:
 
 ```bash
-VERSION=v0.1.0
+VERSION=v0.2.0
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo dev)
 DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 go build -ldflags "-X 'main.version=$VERSION' -X 'main.commit=$COMMIT' -X 'main.date=$DATE'" -o bin/tg-tui .
@@ -60,7 +69,7 @@ go build -ldflags "-X 'main.version=$VERSION' -X 'main.commit=$COMMIT' -X 'main.
 ## Install
 
 ```bash
-go install github.com/FeeeLyX/tg-tui@v0.1.0
+go install github.com/FeeeLyX/tg-tui@v0.2.0
 ```
 
 ## Version Info
@@ -75,7 +84,7 @@ When built with `go build -ldflags`, version metadata is embedded via linker fla
 
 - `Enter`: submit auth, open chat, or send message (context dependent)
 - `q` / `Ctrl+C`: quit
-- `g`: start/regenerate QR login on auth screen
+- `Ctrl+G`: start/regenerate QR login on auth screen
 - `Right`: open selected chat messages
 - `Left` / `Esc`: return from message view to chat list
 - `Up` / `Down`:
@@ -86,6 +95,8 @@ When built with `go build -ldflags`, version metadata is embedded via linker fla
   - auth code step: request a new login code
   - message view: set reply target to selected message
 - `Ctrl+U`: clear reply target
+- `Ctrl+P`: toggle pin for selected chat
+- `Ctrl+Left` / `Ctrl+Right`: switch chat folders
 
 ## Security Notes
 
@@ -105,9 +116,9 @@ When built with `go build -ldflags`, version metadata is embedded via linker fla
 
 ## Scope
 
-v0.1.0 targets private chats and text messaging. Not included yet:
+v0.2.0 includes groups, channels, and bots in addition to private chats and text messaging. Not included yet:
 
-- media/files
+- media/file sending
 - reactions/stickers
 - message edits/deletes
 - advanced search
