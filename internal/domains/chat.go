@@ -40,6 +40,9 @@ type Message struct {
 	ChatID            ChatID
 	SenderName        string
 	Text              string
+	HasImage          bool
+	ImagePreviewASCII string
+	ImageFullASCII    string
 	ReplyToMessageID  int64
 	ReplyToSenderName string
 	ReplyToText       string

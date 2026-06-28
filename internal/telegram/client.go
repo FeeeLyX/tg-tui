@@ -1,11 +1,17 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
 	crand "crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"os"
 	"sort"
 	"strings"
@@ -16,6 +22,7 @@ import (
 	gotd "github.com/gotd/td/telegram"
 	tgauth "github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/telegram/auth/qrlogin"
+	"github.com/gotd/td/telegram/downloader"
 	"github.com/gotd/td/telegram/message/peer"
 	"github.com/gotd/td/telegram/query"
 	"github.com/gotd/td/tg"
@@ -49,20 +56,27 @@ type Client struct {
 	phone            string
 	codeHash         string
 	peerByChatID     map[domains.ChatID]tg.InputPeerClass
+	imageASCIIByKey  map[string]imageASCIICache
 	closed           bool
 	started          bool
 	verbose          bool
 	closeUpdatesOnce sync.Once
 }
 
+type imageASCIICache struct {
+	preview string
+	full    string
+}
+
 func NewClient(config app.Config) *Client {
 	service := &Client{
-		updates:      make(chan domains.AppEvent, 32),
-		readyCh:      make(chan struct{}),
-		stopCh:       make(chan struct{}),
-		doneCh:       make(chan error, 1),
-		verbose:      config.Verbose,
-		peerByChatID: make(map[domains.ChatID]tg.InputPeerClass),
+		updates:         make(chan domains.AppEvent, 32),
+		readyCh:         make(chan struct{}),
+		stopCh:          make(chan struct{}),
+		doneCh:          make(chan error, 1),
+		verbose:         config.Verbose,
+		peerByChatID:    make(map[domains.ChatID]tg.InputPeerClass),
+		imageASCIIByKey: make(map[string]imageASCIICache),
 		authState: app.AuthState{
 			Step: app.AuthStepPhone,
 			Hint: "Enter your Telegram phone number to begin login.",
@@ -748,7 +762,11 @@ func (c *Client) LoadMessages(ctx context.Context, chatID domains.ChatID, limit 
 	messages := make([]domains.Message, 0, limit)
 	for iter.Next(c.context()) {
 		elem := iter.Value()
-		messages = append(messages, mapMessage(elem.Msg, chatID, elem.Entities))
+		mapped := mapMessage(elem.Msg, chatID, elem.Entities)
+		if photo, ok := elem.Photo(); ok {
+			c.enrichMessageWithPhotoASCII(c.context(), raw, chatID, mapped.ID, photo, &mapped)
+		}
+		messages = append(messages, mapped)
 		if len(messages) >= limit {
 			break
 		}
@@ -1206,6 +1224,134 @@ func mapMessage(msg tg.NotEmptyMessage, chatID domains.ChatID, entities peer.Ent
 	}
 
 	return result
+}
+
+func (c *Client) enrichMessageWithPhotoASCII(ctx context.Context, raw *tg.Client, chatID domains.ChatID, messageID int64, photo *tg.Photo, result *domains.Message) {
+	if result == nil || photo == nil || messageID == 0 {
+		return
+	}
+
+	cacheKey := imageCacheKey(chatID, messageID)
+	c.mu.RLock()
+	cached, ok := c.imageASCIIByKey[cacheKey]
+	c.mu.RUnlock()
+	if ok {
+		result.HasImage = true
+		result.ImagePreviewASCII = cached.preview
+		result.ImageFullASCII = cached.full
+		return
+	}
+
+	fileLocation, ok := largestPhotoLocation(photo)
+	if !ok {
+		result.HasImage = true
+		result.ImagePreviewASCII = "[image]"
+		result.ImageFullASCII = "[image unavailable]"
+		return
+	}
+
+	var payload bytes.Buffer
+	_, err := downloader.NewDownloader().Download(raw, fileLocation).WithThreads(2).Stream(ctx, &payload)
+	if err != nil {
+		result.HasImage = true
+		result.ImagePreviewASCII = "[image]"
+		result.ImageFullASCII = "[image download failed]"
+		return
+	}
+
+	src, _, err := image.Decode(bytes.NewReader(payload.Bytes()))
+	if err != nil {
+		result.HasImage = true
+		result.ImagePreviewASCII = "[image]"
+		result.ImageFullASCII = "[image decode failed]"
+		return
+	}
+
+	preview := imageToANSIBlocks(src, 30, 10)
+	full := imageToANSIBlocks(src, 100, 34)
+
+	result.HasImage = true
+	result.ImagePreviewASCII = preview
+	result.ImageFullASCII = full
+
+	c.mu.Lock()
+	c.imageASCIIByKey[cacheKey] = imageASCIICache{preview: preview, full: full}
+	c.mu.Unlock()
+}
+
+func imageCacheKey(chatID domains.ChatID, messageID int64) string {
+	return fmt.Sprintf("%d:%d", chatID, messageID)
+}
+
+type sizedPhoto interface {
+	GetW() int
+	GetH() int
+	GetType() string
+}
+
+func largestPhotoLocation(photo *tg.Photo) (tg.InputFileLocationClass, bool) {
+	if photo == nil {
+		return nil, false
+	}
+
+	typeName := ""
+	bestArea := 0
+	for _, variant := range photo.Sizes {
+		sized, ok := variant.(sizedPhoto)
+		if !ok {
+			continue
+		}
+		area := sized.GetW() * sized.GetH()
+		if area > bestArea {
+			bestArea = area
+			typeName = sized.GetType()
+		}
+	}
+
+	if typeName == "" {
+		return nil, false
+	}
+
+	return photo.AsInputPhotoFileLocation(typeName), true
+}
+
+func imageToANSIBlocks(img image.Image, columns int, maxRows int) string {
+	if img == nil || columns <= 0 || maxRows <= 0 {
+		return "[image]"
+	}
+
+	bounds := img.Bounds()
+	width := bounds.Dx()
+	height := bounds.Dy()
+	if width <= 0 || height <= 0 {
+		return "[image]"
+	}
+
+	rows := int((float64(columns) * float64(height) / float64(width)) * 0.5)
+	if rows < 3 {
+		rows = 3
+	}
+	if rows > maxRows {
+		rows = maxRows
+	}
+
+	lines := make([]string, 0, rows)
+	for y := 0; y < rows; y++ {
+		topY := bounds.Min.Y + ((2*y)*height)/(rows*2)
+		bottomY := bounds.Min.Y + ((2*y+1)*height)/(rows*2)
+		var row strings.Builder
+		row.Grow(columns * 24)
+		for x := 0; x < columns; x++ {
+			sx := bounds.Min.X + (x*width)/columns
+			top := color.RGBAModel.Convert(img.At(sx, topY)).(color.RGBA)
+			bottom := color.RGBAModel.Convert(img.At(sx, bottomY)).(color.RGBA)
+			row.WriteString(fmt.Sprintf("\x1b[38;2;%d;%d;%dm\x1b[48;2;%d;%d;%dm▀", top.R, top.G, top.B, bottom.R, bottom.G, bottom.B))
+		}
+		row.WriteString("\x1b[0m")
+		lines = append(lines, row.String())
+	}
+
+	return strings.Join(lines, "\n")
 }
 
 func extractReplyToMessageID(message *tg.Message) int64 {
