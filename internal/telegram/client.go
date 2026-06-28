@@ -503,23 +503,18 @@ func (c *Client) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, e
 			continue
 		}
 
-		peerUser, ok := elem.Dialog.GetPeer().(*tg.PeerUser)
-		if !ok {
-			// MVP scope: private chats only.
-			continue
-		}
-
-		user, ok := elem.Entities.User(peerUser.UserID)
+		meta, ok := c.dialogMetaFromPeer(elem.Peer, elem.Entities)
 		if !ok {
 			continue
 		}
 
 		lastText, lastAt := extractLastMessage(elem.Last)
-		folderIDs := c.matchCustomFolderIDs(user, elem.Dialog, folders, filterDefs)
+		folderIDs := c.matchCustomFolderIDs(meta, elem.Dialog, folders, filterDefs)
 		folderID := firstFolderID(folderIDs)
 		chat := domains.ChatSummary{
-			ID:              domains.ChatID(user.ID),
-			Title:           privateChatTitle(user),
+			ID:              meta.ChatID,
+			Type:            meta.ChatType,
+			Title:           meta.Title,
 			LastMessageText: lastText,
 			LastMessageAt:   lastAt,
 			UnreadCount:     dialogUnreadCount(elem.Dialog),
@@ -527,7 +522,8 @@ func (c *Client) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, e
 			FolderID:        folderID,
 			FolderIDs:       folderIDs,
 			FolderTitle:     folderTitle(folderTitles, folderID),
-			IsOnline:        isUserOnline(user),
+			IsOnline:        meta.IsOnline,
+			IsBot:           meta.IsBot,
 		}
 		peers[chat.ID] = elem.Peer
 		chats = append(chats, chat)
@@ -536,6 +532,8 @@ func (c *Client) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, e
 	if err := iter.Err(); err != nil {
 		return nil, fmt.Errorf("list dialogs: %w", err)
 	}
+
+	chats = dedupeChatsByID(chats)
 
 	sort.SliceStable(chats, func(i, j int) bool {
 		if chats[i].Pinned != chats[j].Pinned {
@@ -628,8 +626,7 @@ func (c *Client) loadDialogFilters(raw *tg.Client) ([]domains.ChatFolder, map[in
 	return folders, titles, defs
 }
 
-func (c *Client) matchCustomFolderIDs(user *tg.User, dialog tg.DialogClass, folders []domains.ChatFolder, defs map[int]tg.DialogFilterClass) []int {
-	chatID := domains.ChatID(user.ID)
+func (c *Client) matchCustomFolderIDs(meta dialogMeta, dialog tg.DialogClass, folders []domains.ChatFolder, defs map[int]tg.DialogFilterClass) []int {
 	archived := dialogFolderID(dialog) == 1
 	unread := dialogUnreadCount(dialog) > 0
 	matches := make([]int, 0, 2)
@@ -644,7 +641,7 @@ func (c *Client) matchCustomFolderIDs(user *tg.User, dialog tg.DialogClass, fold
 			continue
 		}
 
-		if dialogMatchesFilter(def, user, chatID, archived, unread) {
+		if dialogMatchesFilter(def, meta, archived, unread) {
 			matches = append(matches, folder.ID)
 		}
 	}
@@ -660,24 +657,30 @@ func firstFolderID(folderIDs []int) int {
 	return folderIDs[0]
 }
 
-func dialogMatchesFilter(def tg.DialogFilterClass, user *tg.User, chatID domains.ChatID, archived bool, unread bool) bool {
+func dialogMatchesFilter(def tg.DialogFilterClass, meta dialogMeta, archived bool, unread bool) bool {
 	switch typed := def.(type) {
 	case *tg.DialogFilterChatlist:
-		return peerListContainsUser(typed.PinnedPeers, chatID) || peerListContainsUser(typed.IncludePeers, chatID)
+		return peerListContains(typed.PinnedPeers, meta.Peer) || peerListContains(typed.IncludePeers, meta.Peer)
 	case *tg.DialogFilter:
-		explicitInclude := peerListContainsUser(typed.PinnedPeers, chatID) || peerListContainsUser(typed.IncludePeers, chatID)
-		if peerListContainsUser(typed.ExcludePeers, chatID) {
+		explicitInclude := peerListContains(typed.PinnedPeers, meta.Peer) || peerListContains(typed.IncludePeers, meta.Peer)
+		if peerListContains(typed.ExcludePeers, meta.Peer) {
 			return false
 		}
 
 		match := explicitInclude
-		if typed.Contacts && user.Contact {
+		if typed.Contacts && meta.IsContact {
 			match = true
 		}
-		if typed.NonContacts && !user.Contact {
+		if typed.NonContacts && meta.IsNonContact {
 			match = true
 		}
-		if typed.Bots && user.Bot {
+		if typed.Bots && meta.IsBot {
+			match = true
+		}
+		if typed.Groups && meta.IsGroup {
+			match = true
+		}
+		if typed.Broadcasts && meta.IsBroadcast {
 			match = true
 		}
 
@@ -699,9 +702,9 @@ func dialogMatchesFilter(def tg.DialogFilterClass, user *tg.User, chatID domains
 	return false
 }
 
-func peerListContainsUser(peers []tg.InputPeerClass, chatID domains.ChatID) bool {
+func peerListContains(peers []tg.InputPeerClass, target dialogPeerKey) bool {
 	for _, candidate := range peers {
-		if peerUserID, ok := inputPeerUserID(candidate); ok && domains.ChatID(peerUserID) == chatID {
+		if key, ok := peerKeyFromInputPeer(candidate); ok && key == target {
 			return true
 		}
 	}
@@ -709,15 +712,21 @@ func peerListContainsUser(peers []tg.InputPeerClass, chatID domains.ChatID) bool
 	return false
 }
 
-func inputPeerUserID(candidate tg.InputPeerClass) (int64, bool) {
+func peerKeyFromInputPeer(candidate tg.InputPeerClass) (dialogPeerKey, bool) {
 	switch typed := candidate.(type) {
 	case *tg.InputPeerUser:
-		return typed.UserID, true
+		return dialogPeerKey{Kind: "user", ID: typed.UserID}, true
 	case *tg.InputPeerUserFromMessage:
-		return typed.UserID, true
+		return dialogPeerKey{Kind: "user", ID: typed.UserID}, true
+	case *tg.InputPeerChat:
+		return dialogPeerKey{Kind: "chat", ID: int64(typed.ChatID)}, true
+	case *tg.InputPeerChannel:
+		return dialogPeerKey{Kind: "channel", ID: typed.ChannelID}, true
+	case *tg.InputPeerChannelFromMessage:
+		return dialogPeerKey{Kind: "channel", ID: typed.ChannelID}, true
 	}
 
-	return 0, false
+	return dialogPeerKey{}, false
 }
 
 func (c *Client) ToggleChatPinned(ctx context.Context, chatID domains.ChatID, pinned bool) error {
@@ -1137,6 +1146,145 @@ func mapAuthError(action string, err error) error {
 	}
 
 	return err
+}
+
+type dialogPeerKey struct {
+	Kind string
+	ID   int64
+}
+
+type dialogMeta struct {
+	ChatID       domains.ChatID
+	ChatType     domains.ChatType
+	Peer         dialogPeerKey
+	Title        string
+	IsOnline     bool
+	IsContact    bool
+	IsNonContact bool
+	IsBot        bool
+	IsGroup      bool
+	IsBroadcast  bool
+}
+
+func (c *Client) dialogMetaFromPeer(inputPeer tg.InputPeerClass, entities peer.Entities) (dialogMeta, bool) {
+	key, ok := peerKeyFromInputPeer(inputPeer)
+	if !ok {
+		return dialogMeta{}, false
+	}
+
+	meta := dialogMeta{ChatID: chatIDFromPeerKey(key), Peer: key}
+
+	switch key.Kind {
+	case "user":
+		user, exists := entities.User(key.ID)
+		if !exists {
+			return dialogMeta{}, false
+		}
+		meta.ChatType = domains.ChatTypePrivate
+		meta.Title = privateChatTitle(user)
+		meta.IsOnline = isUserOnline(user)
+		meta.IsContact = user.Contact
+		meta.IsNonContact = !user.Contact
+		meta.IsBot = user.Bot
+		return meta, true
+	case "chat":
+		chat, exists := entities.Chat(key.ID)
+		if !exists {
+			return dialogMeta{}, false
+		}
+		meta.ChatType = domains.ChatTypeGroup
+		title := strings.TrimSpace(chat.Title)
+		if title == "" {
+			title = fmt.Sprintf("Group %d", key.ID)
+		}
+		meta.Title = title
+		meta.IsGroup = true
+		return meta, true
+	case "channel":
+		channel, exists := entities.Channel(key.ID)
+		if !exists {
+			return dialogMeta{}, false
+		}
+		title := strings.TrimSpace(channel.Title)
+		if title == "" {
+			title = fmt.Sprintf("Channel %d", key.ID)
+		}
+		meta.Title = title
+		meta.IsBroadcast = channel.Broadcast && !channel.Megagroup
+		meta.IsGroup = !meta.IsBroadcast
+		if meta.IsBroadcast {
+			meta.ChatType = domains.ChatTypeChannel
+		} else {
+			meta.ChatType = domains.ChatTypeGroup
+		}
+		return meta, true
+	default:
+		return dialogMeta{}, false
+	}
+}
+
+func chatIDFromPeerKey(key dialogPeerKey) domains.ChatID {
+	switch key.Kind {
+	case "chat":
+		return domains.ChatID(-key.ID)
+	case "channel":
+		return domains.ChatID(-1000000000000 - key.ID)
+	default:
+		return domains.ChatID(key.ID)
+	}
+}
+
+func dedupeChatsByID(chats []domains.ChatSummary) []domains.ChatSummary {
+	if len(chats) <= 1 {
+		return chats
+	}
+
+	bestByID := make(map[domains.ChatID]domains.ChatSummary, len(chats))
+	for _, chat := range chats {
+		existing, ok := bestByID[chat.ID]
+		if !ok {
+			bestByID[chat.ID] = chat
+			continue
+		}
+
+		merged := existing
+		if chat.Pinned && !existing.Pinned {
+			merged.Pinned = true
+		}
+		if chat.UnreadCount > merged.UnreadCount {
+			merged.UnreadCount = chat.UnreadCount
+		}
+		if chat.LastMessageAt.After(merged.LastMessageAt) {
+			merged.LastMessageAt = chat.LastMessageAt
+			merged.LastMessageText = chat.LastMessageText
+		}
+		if strings.TrimSpace(merged.Title) == "" && strings.TrimSpace(chat.Title) != "" {
+			merged.Title = chat.Title
+		}
+		if merged.Type == "" && chat.Type != "" {
+			merged.Type = chat.Type
+		}
+		if len(chat.FolderIDs) > len(merged.FolderIDs) {
+			merged.FolderIDs = chat.FolderIDs
+			merged.FolderID = chat.FolderID
+			merged.FolderTitle = chat.FolderTitle
+		}
+		if chat.IsOnline {
+			merged.IsOnline = true
+		}
+		if chat.IsBot {
+			merged.IsBot = true
+		}
+
+		bestByID[chat.ID] = merged
+	}
+
+	unique := make([]domains.ChatSummary, 0, len(bestByID))
+	for _, chat := range bestByID {
+		unique = append(unique, chat)
+	}
+
+	return unique
 }
 
 func privateChatTitle(user *tg.User) string {
