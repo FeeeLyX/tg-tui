@@ -475,6 +475,7 @@ func (c *Client) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, e
 			LastMessageText: lastText,
 			LastMessageAt:   lastAt,
 			UnreadCount:     dialogUnreadCount(elem.Dialog),
+			Pinned:          dialogPinned(elem.Dialog),
 			IsOnline:        isUserOnline(user),
 		}
 		peers[chat.ID] = elem.Peer
@@ -486,6 +487,9 @@ func (c *Client) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, e
 	}
 
 	sort.SliceStable(chats, func(i, j int) bool {
+		if chats[i].Pinned != chats[j].Pinned {
+			return chats[i].Pinned
+		}
 		return chats[i].LastMessageAt.After(chats[j].LastMessageAt)
 	})
 
@@ -494,6 +498,42 @@ func (c *Client) ListPrivateChats(ctx context.Context) ([]domains.ChatSummary, e
 	c.mu.Unlock()
 
 	return chats, nil
+}
+
+func (c *Client) ToggleChatPinned(ctx context.Context, chatID domains.ChatID, pinned bool) error {
+	if err := c.ensureReady(ctx); err != nil {
+		return err
+	}
+
+	if err := c.refreshSession(c.context()); err != nil {
+		return err
+	}
+
+	c.mu.RLock()
+	authorized := c.session.Authorized
+	c.mu.RUnlock()
+	if !authorized {
+		return errors.New("telegram session is not authorized")
+	}
+
+	peerInput, err := c.resolvePeerInput(ctx, chatID)
+	if err != nil {
+		return err
+	}
+
+	raw := tg.NewClient(c.client)
+	_, err = raw.MessagesToggleDialogPin(c.context(), &tg.MessagesToggleDialogPinRequest{
+		Pinned: pinned,
+		Peer: &tg.InputDialogPeer{
+			Peer: peerInput,
+		},
+	})
+	if err != nil {
+		c.logRPCError("toggling dialog pin", err)
+		return mapAuthError("toggling dialog pin", err)
+	}
+
+	return nil
 }
 
 func (c *Client) LoadMessages(ctx context.Context, chatID domains.ChatID, limit int) ([]domains.Message, error) {
@@ -1040,4 +1080,12 @@ func dialogUnreadCount(dialog tg.DialogClass) int {
 	}
 
 	return 0
+}
+
+func dialogPinned(dialog tg.DialogClass) bool {
+	if typed, ok := dialog.(*tg.Dialog); ok {
+		return typed.Pinned
+	}
+
+	return false
 }

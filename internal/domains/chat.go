@@ -23,6 +23,7 @@ type ChatSummary struct {
 	LastMessageText string
 	LastMessageAt   time.Time
 	UnreadCount     int
+	Pinned          bool
 	IsOnline        bool
 }
 
