@@ -17,7 +17,7 @@ import (
 	"github.com/FeeeLyX/tg-tui/internal/ui"
 )
 
-const defaultVersion = "v0.1.0"
+const defaultVersion = "v0.2.0"
 
 var (
 	version = defaultVersion
