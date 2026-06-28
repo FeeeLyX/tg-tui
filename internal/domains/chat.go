@@ -4,6 +4,14 @@ import "time"
 
 type ChatID int64
 
+type ChatType string
+
+const (
+	ChatTypePrivate ChatType = "private"
+	ChatTypeGroup   ChatType = "group"
+	ChatTypeChannel ChatType = "channel"
+)
+
 type MessageDirection string
 
 const (
@@ -24,6 +32,7 @@ type ChatFolder struct {
 
 type ChatSummary struct {
 	ID              ChatID
+	Type            ChatType
 	Title           string
 	LastMessageText string
 	LastMessageAt   time.Time
@@ -33,6 +42,7 @@ type ChatSummary struct {
 	FolderIDs       []int
 	FolderTitle     string
 	IsOnline        bool
+	IsBot           bool
 }
 
 type Message struct {

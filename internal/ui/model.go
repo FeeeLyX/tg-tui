@@ -30,7 +30,6 @@ var (
 	selectedMessageStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("11")).Bold(true)
 	selectedChatStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
 	chatSeparatorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
-	pinnedTagStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
 	folderTagStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	activeFolderTagStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("14")).Bold(true)
 )
@@ -248,7 +247,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.folderScroll = 0
 		}
 		m.reconcilePinOverrides(typed.chats)
-		allChats := m.applyPinOverrides(typed.chats)
+		allChats := m.applyPinOverrides(dedupeChatSummaries(typed.chats))
 		m.allChats = allChats
 		chats := m.filteredChatsForActiveFolder(allChats)
 		previousActive := m.state.ActiveChatID
@@ -281,13 +280,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if len(chats) == 0 {
 			if m.state.ActiveFolderID == 0 {
-				m.state.Status = "Authorized. No private chats found"
+				m.state.Status = "Authorized. No chats found"
 			} else {
 				m.state.Status = fmt.Sprintf("No chats in folder: %s", m.activeFolderTitle())
 			}
 			return m, nil
 		} else {
-			m.state.Status = fmt.Sprintf("Loaded %d private chats", len(chats))
+			m.state.Status = fmt.Sprintf("Loaded %d chats", len(chats))
 			return m, nil
 		}
 	case messagesLoadedMsg:
@@ -938,19 +937,20 @@ func (m Model) renderChats(maxRows int) string {
 			unread = " (" + strconv.Itoa(chat.UnreadCount) + ")"
 		}
 
-		pinnedTag := ""
+		rawPinnedTag := ""
 		if chat.Pinned {
-			pinnedTag = pinnedTagStyle.Render("[PIN] ")
+			rawPinnedTag = "[PIN] "
 		}
+		rawBotTag := m.chatBotTagText(chat)
+		rawTypeTag := m.chatTypeTagText(chat)
+		tagPrefix := rawPinnedTag + rawBotTag + rawTypeTag
 
-		entry := pinnedTag + truncateDisplayWidth(chat.Title+unread+preview, contentWidth-lipgloss.Width(pinnedTag))
-		entryStyle := chatEntryStyle(i-start, max(1, end-start))
+		entryBody := truncateDisplayWidth(chat.Title+unread+preview, max(1, contentWidth-lipgloss.Width(tagPrefix)))
+		entry := m.renderFadedChatEntry(rawPinnedTag, rawBotTag, rawTypeTag, entryBody, i-start, max(1, end-start))
 		if isActive {
-			entry = selectedChatStyle.Render(entry)
-		} else {
-			entry = entryStyle.Render(entry)
+			entry = selectedChatStyle.Render(tagPrefix + entryBody)
 		}
-		entry = lipgloss.NewStyle().Width(contentWidth).MaxWidth(contentWidth).Render(entry)
+		entry = fitPanelLine(entry, contentWidth)
 		lines = append(lines, fmt.Sprintf("%s%s", prefix, entry))
 		if i < end-1 {
 			separator := strings.Repeat("·", max(3, contentWidth-2))
@@ -1496,6 +1496,243 @@ func sortChatsByPinnedAndRecency(chats []domains.ChatSummary) {
 	})
 }
 
+func dedupeChatSummaries(chats []domains.ChatSummary) []domains.ChatSummary {
+	if len(chats) <= 1 {
+		return chats
+	}
+
+	bestByID := make(map[domains.ChatID]domains.ChatSummary, len(chats))
+	for _, chat := range chats {
+		existing, ok := bestByID[chat.ID]
+		if !ok {
+			bestByID[chat.ID] = chat
+			continue
+		}
+
+		merged := existing
+		if chat.Pinned && !merged.Pinned {
+			merged.Pinned = true
+		}
+		if chat.LastMessageAt.After(merged.LastMessageAt) {
+			merged.LastMessageAt = chat.LastMessageAt
+			merged.LastMessageText = chat.LastMessageText
+		}
+		if chat.UnreadCount > merged.UnreadCount {
+			merged.UnreadCount = chat.UnreadCount
+		}
+		if merged.Type == "" && chat.Type != "" {
+			merged.Type = chat.Type
+		}
+		if len(chat.FolderIDs) > len(merged.FolderIDs) {
+			merged.FolderIDs = chat.FolderIDs
+			merged.FolderID = chat.FolderID
+			merged.FolderTitle = chat.FolderTitle
+		}
+		if chat.IsBot {
+			merged.IsBot = true
+		}
+
+		bestByID[chat.ID] = merged
+	}
+
+	unique := make([]domains.ChatSummary, 0, len(bestByID))
+	for _, chat := range bestByID {
+		unique = append(unique, chat)
+	}
+
+	return unique
+}
+
+func (m Model) chatTypeTagText(chat domains.ChatSummary) string {
+	chatType := chat.Type
+	if chatType == "" {
+		chatType = inferChatTypeByID(chat.ID)
+	}
+
+	switch chatType {
+	case domains.ChatTypeGroup:
+		return "[G] "
+	case domains.ChatTypeChannel:
+		return "[C] "
+	default:
+		return ""
+	}
+}
+
+func (m Model) chatBotTagText(chat domains.ChatSummary) string {
+	if chat.IsBot {
+		return "[B] "
+	}
+
+	return ""
+}
+
+func (m Model) renderFadedChatEntry(rawPinnedTag string, rawBotTag string, rawTypeTag string, body string, position int, total int) string {
+	t := chatFadeFactor(position, total)
+	parts := make([]string, 0, 4)
+
+	if rawPinnedTag != "" {
+		parts = append(parts, fadedBoldText(rawPinnedTag, interpolatedColor(pinnedTagColorStops(), t)))
+	}
+
+	if rawBotTag != "" {
+		parts = append(parts, fadedBoldText(rawBotTag, interpolatedColor(botTagColorStops(), t)))
+	}
+
+	if rawTypeTag != "" {
+		parts = append(parts, fadedBoldText(rawTypeTag, interpolatedColor(chatTypeColorStops(rawTypeTag), t)))
+	}
+
+	if body != "" {
+		parts = append(parts, lipgloss.NewStyle().Foreground(interpolatedColor(bodyTextColorStops(), chatFadeFactor(position, total))).Render(body))
+	}
+
+	return strings.Join(parts, "")
+}
+
+func chatTypeColorStops(rawTypeTag string) []colorStop {
+	if rawTypeTag == "[C] " {
+		return []colorStop{
+			{T: 0.00, Index: 13, R: 0xad, G: 0x7f, B: 0xdf},
+			{T: 0.30, Index: 13, R: 0xad, G: 0x7f, B: 0xdf},
+			{T: 0.55, Index: 5, R: 0xc6, G: 0x78, B: 0xdd},
+			{T: 0.80, Index: 7, R: 0xbb, G: 0xc2, B: 0xcf},
+			{T: 1.00, Index: 8, R: 0x8e, G: 0x98, B: 0xa1},
+		}
+	}
+
+	return []colorStop{
+		{T: 0.00, Index: 10, R: 0x74, G: 0xc7, B: 0x9d},
+		{T: 0.30, Index: 10, R: 0x74, G: 0xc7, B: 0x9d},
+		{T: 0.55, Index: 2, R: 0x98, G: 0xc3, B: 0x79},
+		{T: 0.80, Index: 7, R: 0xbb, G: 0xc2, B: 0xcf},
+		{T: 1.00, Index: 8, R: 0x8e, G: 0x98, B: 0xa1},
+	}
+}
+
+func pinnedTagColorStops() []colorStop {
+	return []colorStop{
+		{T: 0.00, Index: 11, R: 0xe5, G: 0xc8, B: 0x90},
+		{T: 0.30, Index: 11, R: 0xe5, G: 0xc8, B: 0x90},
+		{T: 0.55, Index: 3, R: 0xe1, G: 0xae, B: 0x72},
+		{T: 0.80, Index: 7, R: 0xbb, G: 0xc2, B: 0xcf},
+		{T: 1.00, Index: 8, R: 0x8e, G: 0x98, B: 0xa1},
+	}
+}
+
+func botTagColorStops() []colorStop {
+	return []colorStop{
+		{T: 0.00, Index: 12, R: 0x86, G: 0xaf, B: 0xff},
+		{T: 0.30, Index: 12, R: 0x86, G: 0xaf, B: 0xff},
+		{T: 0.55, Index: 4, R: 0x6f, G: 0x8f, B: 0xcf},
+		{T: 0.80, Index: 7, R: 0xbb, G: 0xc2, B: 0xcf},
+		{T: 1.00, Index: 8, R: 0x8e, G: 0x98, B: 0xa1},
+	}
+}
+
+func bodyTextColorStops() []colorStop {
+	return []colorStop{
+		{T: 0.00, Index: 14, R: 0x7f, G: 0xc8, B: 0xcc},
+		{T: 0.25, Index: 14, R: 0x7f, G: 0xc8, B: 0xcc},
+		{T: 0.55, Index: 6, R: 0x79, G: 0xc8, B: 0xd6},
+		{T: 0.80, Index: 7, R: 0xbb, G: 0xc2, B: 0xcf},
+		{T: 1.00, Index: 8, R: 0x8e, G: 0x98, B: 0xa1},
+	}
+}
+
+func fadedBoldText(text string, color lipgloss.Color) string {
+	return lipgloss.NewStyle().Bold(true).Foreground(color).Render(text)
+}
+
+type colorStop struct {
+	T     float64
+	Index int
+	R     int
+	G     int
+	B     int
+}
+
+func interpolatedColor(stops []colorStop, t float64) lipgloss.Color {
+	if len(stops) == 0 {
+		return lipgloss.Color("7")
+	}
+	if t <= stops[0].T {
+		return stopColor(stops[0])
+	}
+	last := stops[len(stops)-1]
+	if t >= last.T {
+		return stopColor(last)
+	}
+
+	left := stops[0]
+	right := last
+	for i := 1; i < len(stops); i++ {
+		if t <= stops[i].T {
+			right = stops[i]
+			left = stops[i-1]
+			break
+		}
+	}
+
+	span := right.T - left.T
+	if span <= 0 {
+		return stopColor(right)
+	}
+
+	localT := (t - left.T) / span
+	r := blendChannel(left.R, right.R, localT)
+	g := blendChannel(left.G, right.G, localT)
+	b := blendChannel(left.B, right.B, localT)
+	return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", r, g, b))
+}
+
+func stopColor(stop colorStop) lipgloss.Color {
+	if stop.R >= 0 && stop.G >= 0 && stop.B >= 0 {
+		return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", stop.R, stop.G, stop.B))
+	}
+	return lipgloss.Color(strconv.Itoa(clampInt(stop.Index, 0, 255)))
+}
+
+func blendChannel(a int, b int, t float64) int {
+	if t <= 0 {
+		return a
+	}
+	if t >= 1 {
+		return b
+	}
+	return int(float64(a) + (float64(b-a) * t))
+}
+
+func chatFadeFactor(position int, total int) float64 {
+	t := 0.0
+	if total > 1 {
+		t = float64(position) / float64(total-1)
+	}
+
+	// Smoothstep keeps transitions softer than a linear gradient.
+	return t * t * (3 - 2*t)
+}
+
+func clampInt(value int, minValue int, maxValue int) int {
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
+}
+
+func inferChatTypeByID(chatID domains.ChatID) domains.ChatType {
+	if chatID > 0 {
+		return domains.ChatTypePrivate
+	}
+	if chatID <= -1000000000000 {
+		return domains.ChatTypeChannel
+	}
+	return domains.ChatTypeGroup
+}
+
 func oneLine(value string) string {
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" {
@@ -1516,10 +1753,22 @@ func oneLine(value string) string {
 			return ' '
 		}
 
+		// Strip combining marks to avoid grapheme-width mismatches that can
+		// shift frame alignment in some terminals/font stacks.
+		if unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r) || unicode.Is(unicode.Me, r) {
+			return -1
+		}
+
 		// Strip emoji and emoji-related joiner/selector runes because some
 		// terminal font stacks report inconsistent width for these sequences.
 		if isEmojiRune(r) {
 			return -1
+		}
+
+		// Keep chat list rendering stable: replace non-single-width glyphs with a
+		// plain space to prevent visual overflow/overlap from ambiguous runes.
+		if w := runewidth.RuneWidth(r); w != 1 {
+			return ' '
 		}
 		return r
 	}, compact)
@@ -1908,7 +2157,7 @@ func renderFramedPanel(title string, hint string, width int, height int, content
 		if i < len(lines) {
 			line = lines[i]
 		}
-		inner := lipgloss.NewStyle().Width(contentWidth).MaxWidth(contentWidth).Render(line)
+		inner := fitPanelLine(line, contentWidth)
 		body = append(body, "│ "+inner+" │")
 	}
 
@@ -1944,6 +2193,30 @@ func frameTopInner(title string, hint string, width int) string {
 	}
 
 	return titleText + strings.Repeat("─", fill) + hintText
+}
+
+func fitPanelLine(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+
+	line := value
+	if strings.Contains(line, "\x1b[") {
+		line = fitANSILine(line, width)
+	} else {
+		line = truncateRawDisplayWidth(line, width)
+	}
+
+	if newline := strings.IndexByte(line, '\n'); newline >= 0 {
+		line = line[:newline]
+	}
+
+	pad := width - lipgloss.Width(line)
+	if pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+
+	return line
 }
 
 func quitAndClearCmd() tea.Cmd {
@@ -2270,22 +2543,7 @@ func (m Model) messageIndexAtContentRow(contentRow int, maxRows int) (int, bool)
 }
 
 func chatEntryStyle(position int, total int) lipgloss.Style {
-	startR, startG, startB := 0x57, 0xd6, 0xd9
-	endR, endG, endB := 0x8e, 0x98, 0xa1
-
-	t := 0.0
-	if total > 1 {
-		t = float64(position) / float64(total-1)
-	}
-
-	// Smoothstep keeps transitions softer than a linear gradient.
-	t = t * t * (3 - 2*t)
-
-	r := int(float64(startR) + (float64(endR-startR) * t))
-	g := int(float64(startG) + (float64(endG-startG) * t))
-	b := int(float64(startB) + (float64(endB-startB) * t))
-
-	return lipgloss.NewStyle().Foreground(lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", r, g, b)))
+	return lipgloss.NewStyle().Foreground(interpolatedColor(bodyTextColorStops(), chatFadeFactor(position, total)))
 }
 
 func (m Model) rightPaneHeights(totalHeight int) (int, int) {
